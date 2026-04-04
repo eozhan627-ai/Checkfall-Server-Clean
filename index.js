@@ -4,6 +4,7 @@ import path from "path";
 import multer from "multer";
 import { Server } from "socket.io";
 import { fileURLToPath } from "url";
+import { getBestMove } from "./stockfish/stockfishserver.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,30 +46,50 @@ io.on("connection", (socket) => {
   console.log("Spieler verbunden:", socket.id);
 
   // =============================
-  // BOT-MATCH (Dummy)
+  // BOT-MATCH 
   // =============================
   socket.on("find_bot_match", (data) => {
-    const { name, avatar } = data;
+    const { name, avatar, level, startFEN } = data;
     const roomId = `bot_${socket.id}`;
     socket.join(roomId);
 
+    // Start der Partie
     io.to(roomId).emit("game_start", {
       roomId,
       white: socket.id,
       black: "bot",
       whiteName: name,
-      blackName: "Bot",
+      blackName: "Stockfish",
       whiteAvatar: avatar || "",
       blackAvatar: "",
     });
+
+    // FEN + Level speichern
+    socket.botRoom = {
+      roomId,
+      level: level || 10,
+      fen: startFEN || "startpos"
+    };
   });
 
   // =============================
   // SPIELERZUG (PvP)
   // =============================
-  socket.on("player_move", ({ roomId, move }) => {
-    // Broadcast an Gegner
+  socket.on("player_move", async ({ roomId, move, fen }) => {
+    // Broadcast an Gegner (PvP oder Dummy)
     socket.to(roomId).emit("opponent_move", move);
+
+    // Stockfish-Bot?
+    if (socket.botRoom && socket.botRoom.roomId === roomId) {
+      // FEN aktualisieren
+      socket.botRoom.fen = fen;
+
+      // Besten Zug berechnen
+      const botMove = await getBestMove(socket.botRoom.fen, socket.botRoom.level);
+
+      // Zug an Spieler senden
+      io.to(roomId).emit("opponent_move", botMove);
+    }
   });
 
   // =============================
