@@ -17,7 +17,9 @@ app.use(express.json());
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, path.join(__dirname, "avatars")),
   filename: (req, file, cb) => {
-    const userId = req.body.userId;
+    console.log("BODY:", req.body); // DEBUG
+
+    const userId = req.body.userId || "unknown";
     const ext = path.extname(file.originalname).toLowerCase();
     cb(null, `avatar_${userId}${ext}`);
   },
@@ -26,7 +28,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 app.post("/upload-avatar", upload.single("avatar"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Keine Datei" });
-  const url = `http://${req.hostname}:3000/avatars/${req.file.filename}`;
+  const url = `https://${req.get("host")}/avatars/${req.file.filename}`;
   res.json({ url });
 });
 app.use("/avatars", express.static(path.join(__dirname, "avatars")));
