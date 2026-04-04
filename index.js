@@ -4,7 +4,7 @@ import path from "path";
 import multer from "multer";
 import { Server } from "socket.io";
 import { fileURLToPath } from "url";
-import { getBestMove } from "./stockfish/stockfishserver.js";
+import { getBestMove } from "./stockfishserver.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
