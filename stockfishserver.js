@@ -6,7 +6,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Pfad zur Stockfish-Exe
-const stockfishPath = path.join(__dirname, "stockfish", "Stockfish-Windows-x86-64-avx2.exe");
+const stockfishPath = path.join(__dirname, "stockfish", "stockfish");
 
 export function getBestMove(fen, depth = 10) {
     return new Promise((resolve, reject) => {
