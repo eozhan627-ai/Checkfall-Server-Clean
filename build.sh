@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
-# Stockfish herunterladen
-wget https://stockfishchess.org/files/stockfish_15.1_linux_x64_avx2.zip
+# Richtiger Download-Link (WICHTIG)
+wget https://github.com/official-stockfish/Stockfish/releases/latest/download/stockfish-ubuntu-x86-64-avx2.tar
 
 # Entpacken
-unzip stockfish_15.1_linux_x64_avx2.zip
+tar -xvf stockfish-ubuntu-x86-64-avx2.tar
 
-# Umbenennen für einfachen Zugriff
-mv stockfish*/stockfish* ./stockfish
+# Datei umbenennen
+mv stockfish/stockfish-ubuntu-x86-64-avx2 stockfish
 
 # ausführbar machen
 chmod +x stockfish
