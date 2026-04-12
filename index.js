@@ -4,7 +4,8 @@ import path from "path";
 import multer from "multer";
 import { Server } from "socket.io";
 import { fileURLToPath } from "url";
-import { getBestMove } from "./stockfishserver.js";
+import { spawn } from "child_process";
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -83,7 +84,21 @@ io.on("connection", (socket) => {
 
     if (!isBotGame) return;
 
-    const botMove = await getBestMove(fen, socket.botRoom.level);
+    const engine = spawn("stockfish");
+
+    engine.stdin.write(`position fen ${fen}\n`);
+    engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
+
+    engine.stdout.on("data", (data) => {
+      const text = data.toString();
+
+      if (text.includes("bestmove")) {
+        const move = text.split("bestmove ")[1].split(" ")[0];
+
+        io.to(roomId).emit("opponent_move", move);
+        engine.kill();
+      }
+    });
 
     io.to(roomId).emit("opponent_move", botMove);
   });
