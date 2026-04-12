@@ -1,12 +1,15 @@
 FROM node:20
 
-RUN apt-get update && apt-get install -y stockfish
-
 WORKDIR /app
 
 COPY package*.json ./
 RUN npm install
 
 COPY . .
+
+# Stockfish ausführbar machen (WICHTIG)
+RUN chmod +x ./stockfish/stockfish
+
+EXPOSE 10000
 
 CMD ["node", "index.js"]

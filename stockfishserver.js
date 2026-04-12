@@ -1,11 +1,16 @@
 import { spawn } from "child_process";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
+console.log(
+    "STOCKFISH EXISTS:",
+    fs.existsSync(path.join(process.cwd(), "stockfish", "stockfish"))
+);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const stockfishPath = path.join(__dirname, "stockfish", "stockfish");
+const stockfishPath = path.join(process.cwd(), "stockfish", "stockfish");
 
 export function getBestMove(fen, depth = 10) {
     return new Promise((resolve, reject) => {
