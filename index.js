@@ -82,17 +82,17 @@ io.on("connection", (socket) => {
     const isBotGame = socket.botRoom?.roomId === roomId;
     if (!isBotGame) return;
 
-    const engine = spawn("stockfish");
+    const engine = spawn("/usr/games/stockfish");
 
-    engine.stdin.write("uci\n");
-    engine.stdin.write(`position fen ${fen}\n`);
-    engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
-
+    // 🔥 DEBUG OUTPUT (WICHTIG)
     engine.stdout.on("data", (data) => {
       const text = data.toString();
+      console.log("STOCKFISH:", text);
 
       if (text.includes("bestmove")) {
         const botMove = text.split("bestmove ")[1].split(" ")[0];
+
+        console.log("BOT MOVE:", botMove);
 
         io.to(roomId).emit("opponent_move", botMove);
 
@@ -100,8 +100,20 @@ io.on("connection", (socket) => {
       }
     });
 
+    engine.stderr.on("data", (data) => {
+      console.log("STOCKFISH ERROR:", data.toString());
+    });
+
+    // 🔥 UCI INITIALISIERUNG (wichtig!)
+    engine.stdin.write("uci\n");
+    engine.stdin.write("isready\n");
+
+    // Position + Start
+    engine.stdin.write(`position fen ${fen}\n`);
+    engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
+
     engine.on("error", (err) => {
-      console.log("Stockfish error:", err);
+      console.log("Stockfish spawn error:", err);
     });
   });
   // =============================
