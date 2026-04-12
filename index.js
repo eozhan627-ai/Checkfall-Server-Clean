@@ -77,15 +77,14 @@ io.on("connection", (socket) => {
   // SPIELERZUG (PvP)
   // =============================
   socket.on("player_move", async ({ roomId, move, fen }) => {
-
     socket.to(roomId).emit("opponent_move", move);
 
     const isBotGame = socket.botRoom?.roomId === roomId;
-
     if (!isBotGame) return;
 
     const engine = spawn("stockfish");
 
+    engine.stdin.write("uci\n");
     engine.stdin.write(`position fen ${fen}\n`);
     engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
 
@@ -93,14 +92,17 @@ io.on("connection", (socket) => {
       const text = data.toString();
 
       if (text.includes("bestmove")) {
-        const move = text.split("bestmove ")[1].split(" ")[0];
+        const botMove = text.split("bestmove ")[1].split(" ")[0];
 
-        io.to(roomId).emit("opponent_move", move);
+        io.to(roomId).emit("opponent_move", botMove);
+
         engine.kill();
       }
     });
 
-    io.to(roomId).emit("opponent_move", botMove);
+    engine.on("error", (err) => {
+      console.log("Stockfish error:", err);
+    });
   });
   // =============================
   // MATCHMAKING
