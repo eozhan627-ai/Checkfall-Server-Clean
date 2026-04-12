@@ -5,7 +5,13 @@ import multer from "multer";
 import { Server } from "socket.io";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
+import { exec } from "child_process";
 
+exec("which stockfish", (err, stdout, stderr) => {
+  console.log("WHICH STOCKFISH:", stdout);
+  console.log("ERROR:", err);
+  console.log("STDERR:", stderr);
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -214,6 +220,7 @@ io.on("connection", (socket) => {
           message: "Dein Gegner hat die App verlassen. Du gewinnst automatisch!",
         });
       }
+
     });
   });
 
