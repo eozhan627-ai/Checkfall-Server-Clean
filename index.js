@@ -76,22 +76,17 @@ io.on("connection", (socket) => {
   // SPIELERZUG (PvP)
   // =============================
   socket.on("player_move", async ({ roomId, move, fen }) => {
-    // Broadcast an Gegner (PvP oder Dummy)
+
     socket.to(roomId).emit("opponent_move", move);
 
-    // Stockfish-Bot?
-    if (socket.botRoom && socket.botRoom.roomId === roomId) {
-      // FEN aktualisieren
-      socket.botRoom.fen = fen;
+    const isBotGame = socket.botRoom?.roomId === roomId;
 
-      // Besten Zug berechnen
-      const botMove = await getBestMove(socket.botRoom.fen, socket.botRoom.level);
+    if (!isBotGame) return;
 
-      // Zug an Spieler senden
-      io.to(roomId).emit("opponent_move", botMove);
-    }
+    const botMove = await getBestMove(fen, socket.botRoom.level);
+
+    io.to(roomId).emit("opponent_move", botMove);
   });
-
   // =============================
   // MATCHMAKING
   // =============================
