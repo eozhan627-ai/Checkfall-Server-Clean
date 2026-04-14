@@ -8,7 +8,7 @@ RUN npm install
 COPY . .
 
 # Stockfish installieren im Container
-RUN apt-get update && apt-get install -y stockfish && which stockfish
+RUN apt-get update && apt-get install -y stockfish 
 
 EXPOSE 10000
 

@@ -87,8 +87,9 @@ io.on("connection", (socket) => {
 
     const isBotGame = socket.botRoom?.roomId === roomId;
     if (!isBotGame) return;
-
     const engine = spawn("stockfish");
+
+    let ready = false;
 
     engine.stdout.on("data", (data) => {
       const text = data.toString();
@@ -98,15 +99,15 @@ io.on("connection", (socket) => {
         engine.stdin.write("isready\n");
       }
 
-      if (text.includes("readyok")) {
+      if (text.includes("readyok") && !ready) {
+        ready = true;
+
         engine.stdin.write(`position fen ${fen}\n`);
         engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
       }
 
       if (text.includes("bestmove")) {
         const botMove = text.split("bestmove ")[1].split(" ")[0];
-
-        console.log("BOT MOVE:", botMove);
 
         io.to(roomId).emit("opponent_move", botMove);
 
@@ -118,11 +119,6 @@ io.on("connection", (socket) => {
       console.log("STOCKFISH ERROR:", data.toString());
     });
 
-    engine.on("error", (err) => {
-      console.log("Stockfish spawn error:", err);
-    });
-
-    // START
     engine.stdin.write("uci\n");
   });
   // =============================
