@@ -140,7 +140,6 @@ io.on("connection", (socket) => {
     });
 
     console.log("📤 sending uci");
-    engine.stdin.write("uci\n");
   });
   // =============================
   // MATCHMAKING
