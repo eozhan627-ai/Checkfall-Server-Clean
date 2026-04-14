@@ -83,42 +83,63 @@ io.on("connection", (socket) => {
   // SPIELERZUG (PvP)
   // =============================
   socket.on("player_move", async ({ roomId, move, fen }) => {
+    console.log("🟢 PLAYER MOVE EVENT", { roomId, move, fen });
+
     socket.to(roomId).emit("opponent_move", move);
 
     const isBotGame = socket.botRoom?.roomId === roomId;
+    console.log("🤖 isBotGame:", isBotGame, socket.botRoom);
+
     if (!isBotGame) return;
+
     const engine = spawn("stockfish");
+
+    console.log("⚙️ Stockfish spawned");
 
     let ready = false;
 
     engine.stdout.on("data", (data) => {
       const text = data.toString();
-      console.log("STOCKFISH:", text);
+      console.log("📥 STOCKFISH OUT:", text);
 
       if (text.includes("uciok")) {
+        console.log("✅ UCI OK");
         engine.stdin.write("isready\n");
       }
 
       if (text.includes("readyok") && !ready) {
+        console.log("🟡 ENGINE READY");
+
         ready = true;
 
+        console.log("📌 sending position:", fen);
         engine.stdin.write(`position fen ${fen}\n`);
+
+        console.log("🚀 sending go depth:", socket.botRoom.level);
         engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
       }
 
       if (text.includes("bestmove")) {
         const botMove = text.split("bestmove ")[1].split(" ")[0];
 
+        console.log("♟️ BOT MOVE:", botMove);
+
         io.to(roomId).emit("opponent_move", botMove);
 
         engine.kill();
+        console.log("❌ ENGINE KILLED");
       }
     });
 
     engine.stderr.on("data", (data) => {
-      console.log("STOCKFISH ERROR:", data.toString());
+      console.log("🔴 STOCKFISH ERROR:", data.toString());
     });
 
+    engine.on("error", (err) => {
+      console.log("💥 SPAWN ERROR:", err);
+    });
+
+    console.log("📤 sending uci");
     engine.stdin.write("uci\n");
   });
   // =============================
