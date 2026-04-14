@@ -88,12 +88,20 @@ io.on("connection", (socket) => {
     const isBotGame = socket.botRoom?.roomId === roomId;
     if (!isBotGame) return;
 
-    const engine = spawn("/usr/games/stockfish");
+    const engine = spawn("stockfish");
 
-    // 🔥 DEBUG OUTPUT (WICHTIG)
     engine.stdout.on("data", (data) => {
       const text = data.toString();
       console.log("STOCKFISH:", text);
+
+      if (text.includes("uciok")) {
+        engine.stdin.write("isready\n");
+      }
+
+      if (text.includes("readyok")) {
+        engine.stdin.write(`position fen ${fen}\n`);
+        engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
+      }
 
       if (text.includes("bestmove")) {
         const botMove = text.split("bestmove ")[1].split(" ")[0];
@@ -110,17 +118,12 @@ io.on("connection", (socket) => {
       console.log("STOCKFISH ERROR:", data.toString());
     });
 
-    // 🔥 UCI INITIALISIERUNG (wichtig!)
-    engine.stdin.write("uci\n");
-    engine.stdin.write("isready\n");
-
-    // Position + Start
-    engine.stdin.write(`position fen ${fen}\n`);
-    engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
-
     engine.on("error", (err) => {
       console.log("Stockfish spawn error:", err);
     });
+
+    // START
+    engine.stdin.write("uci\n");
   });
   // =============================
   // MATCHMAKING
