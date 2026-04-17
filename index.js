@@ -92,7 +92,7 @@ io.on("connection", (socket) => {
 
     if (!isBotGame) return;
 
-    const engine = spawn("/usr/games/stockfish");
+    const engine = spawn("stockfish");
 
     let ready = false;
 
