@@ -2,10 +2,9 @@ FROM node:20-bookworm
 
 WORKDIR /app
 
-# System + Stockfish
-RUN apt-get update \
-    && apt-get install -y stockfish \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y stockfish \
+    && which stockfish || true \
+    && ls -l /usr/games || true
 
 COPY package*.json ./
 RUN npm install
