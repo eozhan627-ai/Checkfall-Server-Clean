@@ -7,7 +7,7 @@ import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { exec } from "child_process";
 
-exec("which stockfish", (err, stdout, stderr) => {
+exec("which stockfish || echo NOT_FOUND", (err, stdout, stderr) => {
   console.log("WHICH STOCKFISH:", stdout);
   console.log("ERROR:", err);
   console.log("STDERR:", stderr);
@@ -92,42 +92,31 @@ io.on("connection", (socket) => {
 
     if (!isBotGame) return;
 
-    const engine = spawn("stockfish");
-
-    console.log("⚙️ Stockfish spawned");
+    const engine = spawn("/usr/games/stockfish");
 
     let ready = false;
 
+    engine.stdin.write("uci\n");
+
     engine.stdout.on("data", (data) => {
       const text = data.toString();
-      console.log("📥 STOCKFISH OUT:", text);
 
       if (text.includes("uciok")) {
-        console.log("✅ UCI OK");
         engine.stdin.write("isready\n");
       }
 
       if (text.includes("readyok") && !ready) {
-        console.log("🟡 ENGINE READY");
-
         ready = true;
 
-        console.log("📌 sending position:", fen);
         engine.stdin.write(`position fen ${fen}\n`);
-
-        console.log("🚀 sending go depth:", socket.botRoom.level);
         engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
       }
 
       if (text.includes("bestmove")) {
         const botMove = text.split("bestmove ")[1].split(" ")[0];
-
-        console.log("♟️ BOT MOVE:", botMove);
-
         io.to(roomId).emit("opponent_move", botMove);
 
         engine.kill();
-        console.log("❌ ENGINE KILlllllllLED");
       }
     });
 
