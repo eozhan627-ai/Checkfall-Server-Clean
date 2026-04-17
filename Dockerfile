@@ -1,5 +1,6 @@
 FROM node:20-bookworm
 
+RUN echo "🔥 DOCKERFILE WIRD GEBUILDDET"
 WORKDIR /app
 RUN apt-get update && apt-get install -y stockfish \
     && stockfish --version \
