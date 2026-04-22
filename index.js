@@ -90,41 +90,39 @@ io.on("connection", (socket) => {
 
     const engine = spawn("/usr/games/stockfish");
 
-    let ready = false;
+    engine.stdin.setEncoding("utf-8");
+
+    let buffer = "";
+    engine.stdout.on("data", (data) => {
+      const lines = data.toString().split("\n");
+
+      for (const line of lines) {
+        const text = line.trim();
+        if (!text) continue;
+
+        console.log("SF:", text);
+
+        if (text === "uciok") {
+          engine.stdin.write("isready\n");
+        }
+
+        if (text === "readyok") {
+          engine.stdin.write(`position fen ${fen}\n`);
+          engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
+        }
+
+        if (text.startsWith("bestmove")) {
+          const botMove = text.split(" ")[1];
+
+          io.to(roomId).emit("opponent_move", botMove);
+
+          engine.stdin.write("quit\n");
+          engine.kill();
+        }
+      }
+    });
 
     engine.stdin.write("uci\n");
-
-    engine.stdout.on("data", (data) => {
-      const text = data.toString();
-
-      if (text.includes("uciok")) {
-        engine.stdin.write("isready\n");
-      }
-
-      if (text.includes("readyok") && !ready) {
-        ready = true;
-
-        engine.stdin.write(`position fen ${fen}\n`);
-        engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
-      }
-
-      if (text.includes("bestmove")) {
-        const botMove = text.split("bestmove ")[1].split(" ")[0];
-        io.to(roomId).emit("opponent_move", botMove);
-
-        engine.kill();
-      }
-    });
-
-    engine.stderr.on("data", (data) => {
-      console.log("🔴 STOCKFISH ERROR:", data.toString());
-    });
-
-    engine.on("error", (err) => {
-      console.log("💥 SPAWN ERROR:", err);
-    });
-
-    console.log("📤 sending uci");
   });
   // =============================
   // MATCHMAKING
