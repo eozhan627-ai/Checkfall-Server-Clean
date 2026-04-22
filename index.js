@@ -7,9 +7,7 @@ import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { exec } from "child_process";
 
-exec("stockfish", (err, stdout, stderr) => {
-  console.log("STOCKFISH START TEST:", err);
-});
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
