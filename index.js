@@ -79,11 +79,13 @@ io.on("connection", (socket) => {
   // SPIELERZUG (PvP)
   // =============================
   socket.on("player_move", async ({ roomId, move, fen }) => {
+
+    console.log("📦 BOT ROOM STATE:", socket.botRoom);
     console.log("🟢 PLAYER MOVE EVENT", { roomId, move, fen });
 
     socket.to(roomId).emit("opponent_move", move);
 
-    const isBotGame = socket.botRoom?.roomId === roomId;
+    const isBotGame = roomId?.startsWith("bot_");
     console.log("🤖 isBotGame:", isBotGame, socket.botRoom);
 
     if (!isBotGame) return;
