@@ -88,40 +88,65 @@ io.on("connection", (socket) => {
 
     if (!isBotGame) return;
 
+    console.log("🚀 STARTING STOCKFISH");
+
     const engine = spawn("/usr/games/stockfish");
 
-    engine.stdin.setEncoding("utf-8");
-
     let buffer = "";
+    let hasStartedSearch = false;
+
     engine.stdout.on("data", (data) => {
-      const lines = data.toString().split("\n");
+      buffer += data.toString();
 
-      for (const line of lines) {
-        const text = line.trim();
-        if (!text) continue;
+      console.log("SF RAW:", data.toString());
 
-        console.log("SF:", text);
+      // UCI INIT
+      if (buffer.includes("uciok")) {
+        engine.stdin.write("isready\n");
+      }
 
-        if (text === "uciok") {
-          engine.stdin.write("isready\n");
-        }
+      // READY → POSITION + GO
+      if (buffer.includes("readyok") && !hasStartedSearch) {
+        hasStartedSearch = true;
 
-        if (text === "readyok") {
-          engine.stdin.write(`position fen ${fen}\n`);
-          engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
-        }
+        const positionCommand =
+          fen === "startpos"
+            ? "position startpos"
+            : `position fen ${fen}`;
 
-        if (text.startsWith("bestmove")) {
-          const botMove = text.split(" ")[1];
+        console.log("📤 POSITION:", positionCommand);
 
-          io.to(roomId).emit("opponent_move", botMove);
+        engine.stdin.write(positionCommand + "\n");
+        engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
+      }
 
-          engine.stdin.write("quit\n");
-          engine.kill();
-        }
+      // BEST MOVE
+      const match = buffer.match(/bestmove\s(\S+)/);
+      if (match) {
+        const botMove = match[1];
+
+        console.log("🤖 BOT MOVE:", botMove);
+
+        io.to(roomId).emit("opponent_move", botMove);
+
+        engine.stdin.write("quit\n");
+        engine.kill();
       }
     });
 
+    engine.stderr.on("data", (data) => {
+      console.log("❌ STOCKFISH STDERR:", data.toString());
+    });
+
+    engine.on("error", (err) => {
+      console.log("💥 SPAWN ERROR:", err);
+    });
+
+    engine.on("exit", (code) => {
+      console.log("🛑 STOCKFISH EXIT:", code);
+    });
+
+    // START
     engine.stdin.write("uci\n");
   });
   // =============================
