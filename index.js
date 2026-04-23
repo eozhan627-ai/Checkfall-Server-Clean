@@ -15,6 +15,8 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json());
 
+const botRooms = new Map();
+
 // =============================
 // AVATAR UPLOAD
 // =============================
@@ -53,10 +55,15 @@ io.on("connection", (socket) => {
   // =============================
   socket.on("find_bot_match", (data) => {
     const { name, avatar, level, startFEN } = data;
+
     const roomId = `bot_${socket.id}`;
     socket.join(roomId);
 
-    // Start der Partie
+    botRooms.set(roomId, {
+      level: level || 10,
+      fen: startFEN || "startpos",
+    });
+
     io.to(roomId).emit("game_start", {
       roomId,
       white: socket.id,
@@ -66,13 +73,6 @@ io.on("connection", (socket) => {
       whiteAvatar: avatar || "",
       blackAvatar: "",
     });
-
-    // FEN + Level speichern
-    socket.botRoom = {
-      roomId,
-      level: level || 10,
-      fen: startFEN || "startpos"
-    };
   });
 
   // =============================
@@ -85,8 +85,11 @@ io.on("connection", (socket) => {
 
     socket.to(roomId).emit("opponent_move", move);
 
-    const isBotGame = roomId?.startsWith("bot_");
-    console.log("🤖 isBotGame:", isBotGame, socket.botRoom);
+    const botState = botRooms.get(roomId);
+    const isBotGame = !!botState;
+
+    console.log("📦 BOT STATE:", botState);
+    console.log("🤖 isBotGame:", isBotGame);
 
     if (!isBotGame) return;
 
@@ -112,14 +115,14 @@ io.on("connection", (socket) => {
         hasStartedSearch = true;
 
         const positionCommand =
-          fen === "startpos"
-            ? "position startpos"
-            : `position fen ${fen}`;
+          fen && fen !== "startpos"
+            ? `position fen ${fen}`
+            : "position startpos";
 
         console.log("📤 POSITION:", positionCommand);
 
         engine.stdin.write(positionCommand + "\n");
-        engine.stdin.write(`go depth ${socket.botRoom.level}\n`);
+        engine.stdin.write(`go depth ${botState.level}\n`);
       }
 
       // BEST MOVE
