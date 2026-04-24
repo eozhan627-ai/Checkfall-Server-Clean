@@ -5,7 +5,7 @@ import multer from "multer";
 import { Server } from "socket.io";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { exec } from "child_process";
+
 
 
 
@@ -83,10 +83,14 @@ io.on("connection", (socket) => {
     console.log("📦 BOT ROOM STATE:", socket.botRoom);
     console.log("🟢 PLAYER MOVE EVENT", { roomId, move, fen });
 
-    socket.to(roomId).emit("opponent_move", move);
 
     const botState = botRooms.get(roomId);
     const isBotGame = !!botState;
+
+
+    if (!isBotGame) {
+      socket.to(roomId).emit("opponent_move", move);
+    }
 
     console.log("📦 BOT STATE:", botState);
     console.log("🤖 isBotGame:", isBotGame);
@@ -95,7 +99,7 @@ io.on("connection", (socket) => {
 
     console.log("🚀 STARTING STOCKFISH");
 
-    const engine = spawn("/usr/games/stockfish");
+    const engine = spawn("stockfish");
 
     let buffer = "";
     let hasStartedSearch = false;
@@ -132,8 +136,11 @@ io.on("connection", (socket) => {
 
         console.log("🤖 BOT MOVE:", botMove);
 
-        io.to(roomId).emit("opponent_move", botMove);
+        setTimeout(() => {
+          io.to(roomId).emit("opponent_move", botMove);
+        }, 500); // 0.5 Sekunden Delay
 
+        buffer = "";
         engine.stdin.write("quit\n");
         engine.kill();
       }
