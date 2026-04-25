@@ -4,7 +4,7 @@ import path from "path";
 import multer from "multer";
 import { Server } from "socket.io";
 import { fileURLToPath } from "url";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 
 console.log("Docker check started");
 
@@ -98,7 +98,17 @@ io.on("connection", (socket) => {
 
     console.log("🚀 STARTING STOCKFISH");
 
-    const engine = spawn("stockfish");
+    const stockfishPath = path.join(process.cwd(), "engine", "stockfish");
+
+    console.log("ENGINE PATH:", stockfishPath);
+
+    try {
+      execSync(`chmod +x ${stockfishPath}`);
+    } catch (e) {
+      console.log("chmod failed (ignored)");
+    }
+
+    const engine = spawn(stockfishPath);
 
     let buffer = "";
     let hasStartedSearch = false;
