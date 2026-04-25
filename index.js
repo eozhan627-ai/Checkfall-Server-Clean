@@ -98,17 +98,8 @@ io.on("connection", (socket) => {
 
     console.log("🚀 STARTING STOCKFISH");
 
-    const stockfishPath = path.join(process.cwd(), "engine", "stockfish");
 
-    console.log("ENGINE PATH:", stockfishPath);
-
-    try {
-      execSync(`chmod +x ${stockfishPath}`);
-    } catch (e) {
-      console.log("chmod failed (ignored)");
-    }
-
-    const engine = spawn(stockfishPath);
+    const engine = spawn("stockfish");
 
     let buffer = "";
     let hasStartedSearch = false;
