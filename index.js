@@ -99,7 +99,7 @@ io.on("connection", (socket) => {
     console.log("🚀 STARTING STOCKFISH");
 
 
-    const engine = spawn("stockfish");
+    const engine = spawn("/usr/games/stockfish");
 
     let buffer = "";
     let hasStartedSearch = false;
