@@ -6,8 +6,7 @@ import { Server } from "socket.io";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 
-
-
+console.log("Docker check started");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -99,53 +98,38 @@ io.on("connection", (socket) => {
 
     console.log("🚀 STARTING STOCKFISH");
 
-    const engine = spawn("/usr/games/stockfish");
+    const engine = spawn("stockfish");
 
     let buffer = "";
     let hasStartedSearch = false;
 
     engine.stdout.on("data", (data) => {
-      buffer += data.toString();
+      const text = data.toString();
+      console.log("SF:", text);
 
-      console.log("SF RAW:", data.toString());
-
-      // UCI INIT
-      if (buffer.includes("uciok")) {
+      if (text.includes("uciok")) {
         engine.stdin.write("isready\n");
       }
 
-      // READY → POSITION + GO
-      if (buffer.includes("readyok") && !hasStartedSearch) {
+      if (text.includes("readyok") && !hasStartedSearch) {
         hasStartedSearch = true;
 
-        const positionCommand =
-          fen && fen !== "startpos"
-            ? `position fen ${fen}`
-            : "position startpos";
-
-        console.log("📤 POSITION:", positionCommand);
-
-        engine.stdin.write(positionCommand + "\n");
-        engine.stdin.write(`go depth ${botState.level}\n`);
+        engine.stdin.write(`position fen ${fen}\n`);
+        engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
       }
 
-      // BEST MOVE
-      const match = buffer.match(/bestmove\s(\S+)/);
+      const match = text.match(/bestmove\s(\S+)/);
       if (match) {
         const botMove = match[1];
 
-        console.log("🤖 BOT MOVE:", botMove);
-
         setTimeout(() => {
           io.to(roomId).emit("opponent_move", botMove);
-        }, 500); // 0.5 Sekunden Delay
+        }, 500);
 
-        buffer = "";
         engine.stdin.write("quit\n");
         engine.kill();
       }
     });
-
     engine.stderr.on("data", (data) => {
       console.log("❌ STOCKFISH STDERR:", data.toString());
     });
