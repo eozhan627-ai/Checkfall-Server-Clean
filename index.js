@@ -132,7 +132,7 @@ io.on("connection", (socket) => {
                 }, 400);
 
                 engine.stdin.write("quit\n");
-                engine.kill();
+                engine.kill("SIGTERM");
             }
         });
 
