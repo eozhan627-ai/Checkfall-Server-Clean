@@ -123,7 +123,11 @@ io.on("connection", (socket) => {
                 if (line === "readyok" && stage === "ready") {
                     stage = "go";
 
-                    engine.stdin.write(`position fen ${fen}\n`);
+                    if (fen === "startpos") {
+                        engine.stdin.write("position startpos\n");
+                    } else {
+                        engine.stdin.write(`position fen ${fen}\n`);
+                    }
                     engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
                 }
 
