@@ -60,7 +60,6 @@ io.on("connection", (socket) => {
 
         botRooms.set(roomId, {
             level: level || 10,
-            fen: startFEN || "startpos",
         });
 
         io.to(roomId).emit("game_start", {
@@ -102,40 +101,48 @@ io.on("connection", (socket) => {
         let hasMoved = false;
         let stage = "uci";
 
+        let buffer = "";
+
         engine.stdout.on("data", (data) => {
-            const text = data.toString();
-            console.log("SF:", text);
+            buffer += data.toString();
 
-            // 1. UCI handshake
-            if (text.includes("uciok") && stage === "uci") {
-                stage = "ready";
-                engine.stdin.write("isready\n");
-            }
+            let lines = buffer.split("\n");
+            buffer = lines.pop(); // Rest behalten
 
-            // 2. Engine bereit → Position setzen + rechnen
-            if (text.includes("readyok") && stage === "ready") {
-                stage = "go";
+            for (let line of lines) {
+                line = line.trim();
+                console.log("SF:", line);
 
-                engine.stdin.write(`position fen ${fen}\n`);
-                engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
-            }
+                // 1. UCI handshake
+                if (line === "uciok" && stage === "uci") {
+                    stage = "ready";
+                    engine.stdin.write("isready\n");
+                }
 
-            // 3. Move bekommen
-            const match = text.match(/bestmove\s(\S+)/);
-            if (match && !hasMoved) {
-                hasMoved = true;
+                // 2. Ready → starten
+                if (line === "readyok" && stage === "ready") {
+                    stage = "go";
 
-                const botMove = match[1];
+                    engine.stdin.write(`position fen ${fen}\n`);
+                    engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
+                }
 
-                setTimeout(() => {
+                // 3. BESTMOVE (wichtig)
+                if (line.startsWith("bestmove") && !hasMoved) {
+                    hasMoved = true;
+
+                    const botMove = line.split(" ")[1];
+
                     io.to(roomId).emit("opponent_move", botMove);
-                }, 400);
 
-                engine.stdin.write("quit\n");
-                engine.kill("SIGTERM");
+                    engine.stdin.write("quit\n");
+
+                    setTimeout(() => {
+                        engine.kill("SIGTERM");
+                    }, 50);
+                }
             }
         });
-
         engine.stderr.on("data", (data) => {
             console.log("❌ STOCKFISH STDERR:", data.toString());
         });
