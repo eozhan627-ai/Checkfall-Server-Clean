@@ -78,7 +78,7 @@ io.on("connection", (socket) => {
     // =============================
     // SPIELERZUG (PvP)
     // =============================
-    socket.on("player_move", async ({ roomId, move }) => {
+    socket.on("player_move", async ({ roomId, move, fen }) => {
 
 
 
