@@ -5,6 +5,7 @@ import multer from "multer";
 import { Server } from "socket.io";
 import { fileURLToPath } from "url";
 import { spawn, execSync } from "child_process";
+import { Chess } from "chess.js";
 
 console.log("Docker check started");
 
@@ -60,6 +61,7 @@ io.on("connection", (socket) => {
 
         botRooms.set(roomId, {
             level: level || 10,
+            game: new Chess(),
         });
 
         io.to(roomId).emit("game_start", {
@@ -76,15 +78,27 @@ io.on("connection", (socket) => {
     // =============================
     // SPIELERZUG (PvP)
     // =============================
-    socket.on("player_move", async ({ roomId, move, fen }) => {
+    socket.on("player_move", async ({ roomId, move }) => {
 
-        console.log("📦 BOT ROOM STATE:", socket.botRoom);
-        console.log("🟢 PLAYER MOVE EVENT", { roomId, move, fen });
 
 
         const botState = botRooms.get(roomId);
         const isBotGame = !!botState;
 
+        const game = botState?.game;
+
+        if (isBotGame && game) {
+            const result = game.move({
+                from: move.slice(0, 2),
+                to: move.slice(2, 4),
+                promotion: move.length > 4 ? move[4] : undefined
+            });
+
+            if (!result) {
+                console.log("❌ INVALID PLAYER MOVE");
+                return;
+            }
+        }
 
         if (!isBotGame) {
             socket.to(roomId).emit("opponent_move", move);
@@ -123,11 +137,8 @@ io.on("connection", (socket) => {
                 if (line === "readyok" && stage === "ready") {
                     stage = "go";
 
-                    if (fen === "startpos") {
-                        engine.stdin.write("position startpos\n");
-                    } else {
-                        engine.stdin.write(`position fen ${fen}\n`);
-                    }
+                    const currentFen = game.fen();
+                    engine.stdin.write(`position fen ${currentFen}\n`);
                     engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
                 }
 
@@ -137,6 +148,13 @@ io.on("connection", (socket) => {
 
                     const botMove = line.split(" ")[1];
 
+                    if (game) {
+                        game.move({
+                            from: botMove.slice(0, 2),
+                            to: botMove.slice(2, 4),
+                            promotion: move.length > 4 ? move[4] : undefined
+                        });
+                    }
                     io.to(roomId).emit("opponent_move", botMove);
 
                     engine.stdin.write("quit\n");
