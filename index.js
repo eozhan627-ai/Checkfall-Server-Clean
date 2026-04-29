@@ -12,6 +12,7 @@ console.log("Docker check started");
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+
 const app = express();
 app.use(express.json());
 
@@ -44,7 +45,74 @@ app.use("/avatars", express.static(path.join(__dirname, "avatars")));
 // =============================
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+function getEngine(botState) {
+    if (botState.engine) return botState.engine;
 
+    const engine = spawn("/usr/games/stockfish");
+
+    let buffer = "";
+
+    botState.engine = engine;
+    return engine;
+}
+function startBotMove(roomId) {
+    const botState = botRooms.get(roomId);
+    if (!botState) return;
+
+    const game = botState.game;
+
+    const engine = getEngine(botState);
+
+    let hasMoved = false;
+    let stage = "uci";
+    let buffer = "";
+
+    if (!botState.buffer) botState.buffer = "";
+    if (!botState.stage) botState.stage = "uci";
+    if (!botState.hasMoved) botState.hasMoved = false;
+
+    engine.stdout.on("data", (data) => {
+        buffer += data.toString();
+        let lines = buffer.split("\n");
+        buffer = lines.pop();
+
+        for (let line of lines) {
+            line = line.trim();
+
+            if (line === "uciok" && stage === "uci") {
+                stage = "ready";
+                engine.stdin.write("isready\n");
+            }
+
+            if (line === "readyok" && stage === "ready") {
+                stage = "go";
+
+                engine.stdin.write(`position fen ${botState.lastFen || game.fen()}\n`);
+                engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
+            }
+
+            if (line.startsWith("bestmove") && !hasMoved) {
+                hasMoved = true;
+
+                const botMove = line.split(" ")[1];
+
+                botState.thinking = false;
+                game.move({
+                    from: botMove.slice(0, 2),
+                    to: botMove.slice(2, 4),
+                    promotion: undefined
+                });
+
+                io.to(roomId).emit("opponent_move", botMove);
+
+                engine.stdin.write("quit\n");
+
+            }
+        }
+    });
+
+    engine.stdin.write("uci\n");
+}
 let waitingPlayer = null;
 
 io.on("connection", (socket) => {
@@ -66,6 +134,7 @@ io.on("connection", (socket) => {
         botRooms.set(roomId, {
             level: level || 10,
             game,
+            engine: null,
             botColor: botIsWhite ? "w" : "b",
         });
 
@@ -93,8 +162,14 @@ io.on("connection", (socket) => {
 
 
         const botState = botRooms.get(roomId);
+        if (!botState) return;
+
         const isBotGame = !!botState;
 
+        // wenn Bot Schwarz ist → nach Player Move starten
+        if (botState.botColor === "b" && !botState.thinking) {
+            startBotMove(roomId);
+        }
         const game = botState?.game;
 
         if (isBotGame && game) {
@@ -120,75 +195,6 @@ io.on("connection", (socket) => {
         if (!isBotGame) return;
         console.log("🚀 STARTING STOCKFISH");
 
-        const engine = spawn("/usr/games/stockfish");
-
-        let hasMoved = false;
-        let stage = "uci";
-
-        let buffer = "";
-
-        engine.stdout.on("data", (data) => {
-            buffer += data.toString();
-
-            let lines = buffer.split("\n");
-            buffer = lines.pop(); // Rest behalten
-
-            for (let line of lines) {
-                line = line.trim();
-                console.log("SF:", line);
-
-                // 1. UCI handshake
-                if (line === "uciok" && stage === "uci") {
-                    stage = "ready";
-                    engine.stdin.write("isready\n");
-                }
-
-                // 2. Ready → starten
-                if (line === "readyok" && stage === "ready") {
-                    stage = "go";
-
-                    const currentFen = game.fen();
-                    engine.stdin.write(`position fen ${currentFen}\n`);
-                    engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
-                }
-
-                // 3. BESTMOVE (wichtig)
-                if (line.startsWith("bestmove") && !hasMoved) {
-                    hasMoved = true;
-
-                    const botMove = line.split(" ")[1];
-
-                    if (game) {
-                        game.move({
-                            from: botMove.slice(0, 2),
-                            to: botMove.slice(2, 4),
-                            promotion: move.length > 4 ? move[4] : undefined
-                        });
-                    }
-                    io.to(roomId).emit("opponent_move", botMove);
-
-                    engine.stdin.write("quit\n");
-
-                    setTimeout(() => {
-                        engine.kill("SIGTERM");
-                    }, 50);
-                }
-            }
-        });
-        engine.stderr.on("data", (data) => {
-            console.log("❌ STOCKFISH STDERR:", data.toString());
-        });
-
-        engine.on("error", (err) => {
-            console.log("💥 SPAWN ERROR:", err);
-        });
-
-        engine.on("exit", (code) => {
-            console.log("🛑 STOCKFISH EXIT:", code);
-        });
-
-        // START
-        engine.stdin.write("uci\n");
     });
     // =============================
     // MATCHMAKING
