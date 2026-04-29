@@ -242,6 +242,7 @@ io.on("connection", (socket) => {
             result: "won",
             message: "Dein Gegner hat aufgegeben. Du gewinnst!",
         });
+        botRooms.delete(roomId);
     });
 
     // =============================
