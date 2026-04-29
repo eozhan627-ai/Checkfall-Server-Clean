@@ -54,25 +54,35 @@ io.on("connection", (socket) => {
     // BOT-MATCH 
     // =============================
     socket.on("find_bot_match", (data) => {
-        const { name, avatar, level, startFEN } = data;
+        const { name, avatar, level } = data;
 
         const roomId = `bot_${socket.id}`;
         socket.join(roomId);
 
+        const botIsWhite = Math.random() < 0.5;
+
+        const game = new Chess();
+
         botRooms.set(roomId, {
             level: level || 10,
-            game: new Chess(),
+            game,
+            botColor: botIsWhite ? "w" : "b",
         });
 
         io.to(roomId).emit("game_start", {
             roomId,
-            white: socket.id,
-            black: "bot",
-            whiteName: name,
-            blackName: "Stockfish",
-            whiteAvatar: avatar || "",
-            blackAvatar: "",
+            white: botIsWhite ? "bot" : socket.id,
+            black: botIsWhite ? socket.id : "bot",
+            whiteName: botIsWhite ? "Stockfish" : name,
+            blackName: botIsWhite ? "Stockfish" : name,
+            whiteAvatar: "",
+            blackAvatar: avatar || "",
         });
+
+        // WICHTIG → Bot startet sofort wenn Weiß
+        if (botIsWhite) {
+            startBotMove(roomId);
+        }
     });
 
     // =============================
