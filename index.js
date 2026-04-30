@@ -4,8 +4,9 @@ import path from "path";
 import multer from "multer";
 import { Server } from "socket.io";
 import { fileURLToPath } from "url";
-import { spawn, execSync } from "child_process";
+import { spawn } from "child_process";
 import { Chess } from "chess.js";
+
 
 console.log("Docker check started");
 
@@ -46,18 +47,19 @@ app.use("/avatars", express.static(path.join(__dirname, "avatars")));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 function getEngine(botState) {
-    if (botState.engine) return botState.engine;
+    if (botState.engine) {
+        return botState.engine;
+    }
 
     const engine = spawn("/usr/games/stockfish");
-
     let buffer = "";
+
+    botState.engineReady = false;
 
     engine.stdout.on("data", (data) => {
         buffer += data.toString();
-        let lines = buffer.split("\n");
+        const lines = buffer.split("\n");
         buffer = lines.pop();
-
-        const game = botState.game;
 
         for (let line of lines) {
             line = line.trim();
@@ -67,20 +69,29 @@ function getEngine(botState) {
             }
 
             if (line === "readyok") {
-                engine.stdin.write(`position fen ${game.fen()}\n`);
-                engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
+                botState.engineReady = true;
+                console.log("✅ Stockfish ready");
             }
 
             if (line.startsWith("bestmove")) {
                 const move = line.split(" ")[1];
+                const game = botState.game;
 
-                game.move({
+                const result = game.move({
                     from: move.slice(0, 2),
                     to: move.slice(2, 4),
-                    promotion: undefined
+                    promotion: move.length > 4 ? move[4] : undefined
                 });
 
+                if (!result) {
+                    console.log("❌ STOCKFISH INVALID MOVE:", move);
+                    botState.thinking = false;
+                    return;
+                }
+
                 io.to(botState.roomId).emit("opponent_move", move);
+
+                botState.thinking = false;
             }
         }
     });
@@ -89,11 +100,20 @@ function getEngine(botState) {
 
     botState.engine = engine;
     return engine;
-} function startBotMove(roomId) {
+}
+function startBotMove(roomId) {
     const botState = botRooms.get(roomId);
     if (!botState) return;
+    if (botState.thinking) return;
 
     const engine = getEngine(botState);
+
+    if (!botState.engineReady) {
+        console.log("⏳ Engine noch nicht ready");
+        return;
+    }
+
+    botState.thinking = true;
 
     engine.stdin.write(`position fen ${botState.game.fen()}\n`);
     engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
@@ -117,9 +137,12 @@ io.on("connection", (socket) => {
         const game = new Chess();
 
         botRooms.set(roomId, {
+            roomId,
             level: level || 10,
             game,
             engine: null,
+            thinking: false,
+            engineReady: false,
             botColor: botIsWhite ? "w" : "b",
         });
 
@@ -149,12 +172,13 @@ io.on("connection", (socket) => {
         const botState = botRooms.get(roomId);
         if (!botState) return;
 
+
+        if (botState.thinking) return;
+
         const isBotGame = !!botState;
 
-        // wenn Bot Schwarz ist → nach Player Move starten
-        if (botState.botColor === "b" && !botState.thinking) {
-            startBotMove(roomId);
-        }
+
+
         const game = botState?.game;
 
         if (isBotGame && game) {
@@ -166,8 +190,16 @@ io.on("connection", (socket) => {
 
             if (!result) {
                 console.log("❌ INVALID PLAYER MOVE");
+                botState.thinking = false;
                 return;
             }
+        }
+        if (
+            isBotGame &&
+            game.turn() === botState.botColor &&
+            !botState.thinking
+        ) {
+            startBotMove(roomId);
         }
 
         if (!isBotGame) {
