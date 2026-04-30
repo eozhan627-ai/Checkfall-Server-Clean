@@ -52,66 +52,51 @@ function getEngine(botState) {
 
     let buffer = "";
 
-    botState.engine = engine;
-    return engine;
-}
-function startBotMove(roomId) {
-    const botState = botRooms.get(roomId);
-    if (!botState) return;
-
-    const game = botState.game;
-
-    const engine = getEngine(botState);
-
-    let hasMoved = false;
-    let stage = "uci";
-    let buffer = "";
-
-    if (!botState.buffer) botState.buffer = "";
-    if (!botState.stage) botState.stage = "uci";
-    if (!botState.hasMoved) botState.hasMoved = false;
-
     engine.stdout.on("data", (data) => {
         buffer += data.toString();
         let lines = buffer.split("\n");
         buffer = lines.pop();
 
+        const game = botState.game;
+
         for (let line of lines) {
             line = line.trim();
 
-            if (line === "uciok" && stage === "uci") {
-                stage = "ready";
+            if (line === "uciok") {
                 engine.stdin.write("isready\n");
             }
 
-            if (line === "readyok" && stage === "ready") {
-                stage = "go";
-
-                engine.stdin.write(`position fen ${botState.lastFen || game.fen()}\n`);
+            if (line === "readyok") {
+                engine.stdin.write(`position fen ${game.fen()}\n`);
                 engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
             }
 
-            if (line.startsWith("bestmove") && !hasMoved) {
-                hasMoved = true;
+            if (line.startsWith("bestmove")) {
+                const move = line.split(" ")[1];
 
-                const botMove = line.split(" ")[1];
-
-                botState.thinking = false;
                 game.move({
-                    from: botMove.slice(0, 2),
-                    to: botMove.slice(2, 4),
+                    from: move.slice(0, 2),
+                    to: move.slice(2, 4),
                     promotion: undefined
                 });
 
-                io.to(roomId).emit("opponent_move", botMove);
-
-                engine.stdin.write("quit\n");
-
+                io.to(botState.roomId).emit("opponent_move", move);
             }
         }
     });
 
     engine.stdin.write("uci\n");
+
+    botState.engine = engine;
+    return engine;
+} function startBotMove(roomId) {
+    const botState = botRooms.get(roomId);
+    if (!botState) return;
+
+    const engine = getEngine(botState);
+
+    engine.stdin.write(`position fen ${botState.game.fen()}\n`);
+    engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
 }
 let waitingPlayer = null;
 
