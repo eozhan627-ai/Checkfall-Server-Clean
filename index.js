@@ -71,8 +71,14 @@ function getEngine(botState) {
             if (line === "readyok") {
                 botState.engineReady = true;
                 console.log("✅ Stockfish ready");
-            }
 
+                if (
+                    botState.game.turn() === botState.botColor &&
+                    !botState.thinking
+                ) {
+                    startBotMove(botState.roomId);
+                }
+            }
             if (line.startsWith("bestmove")) {
                 const move = line.split(" ")[1];
                 const game = botState.game;
@@ -198,11 +204,8 @@ io.on("connection", (socket) => {
                 return;
             }
         }
-        if (
-            isBotGame &&
-            game.turn() === botState.botColor &&
-            !botState.thinking
-        ) {
+        if (isBotGame && game.turn() === botState.botColor) {
+            console.log("🤖 Bot ist dran → starte Zug");
             startBotMove(roomId);
         }
 
