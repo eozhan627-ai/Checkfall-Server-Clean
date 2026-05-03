@@ -157,15 +157,19 @@ io.on("connection", (socket) => {
         });
 
         // WICHTIG → Bot startet sofort wenn Weiß
-        if (botIsWhite) {
-            startBotMove(roomId);
-        }
+        getEngine(botRooms.get(roomId));
+
+        setTimeout(() => {
+            if (botIsWhite) {
+                startBotMove(roomId);
+            }
+        }, 500);
     });
 
     // =============================
     // SPIELERZUG (PvP)
     // =============================
-    socket.on("player_move", async ({ roomId, move, fen }) => {
+    socket.on("player_move", async ({ roomId, move }) => {
 
 
 
