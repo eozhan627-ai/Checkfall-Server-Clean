@@ -121,8 +121,10 @@ function startBotMove(roomId) {
 
     botState.thinking = true;
 
-    engine.stdin.write(`position fen ${botState.game.fen()}\n`);
-    engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
+    setTimeout(() => {
+        engine.stdin.write(`position fen ${botState.game.fen()}\n`);
+        engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
+    }, 500);
 }
 let waitingPlayer = null;
 
