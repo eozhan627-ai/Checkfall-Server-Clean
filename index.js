@@ -6,13 +6,17 @@ import { Server } from "socket.io";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { Chess } from "chess.js";
+import fs from "fs";
 
 
 console.log("Docker check started");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const avatarDir = path.join(__dirname, "avatars");
 
+// Ordner sicher erstellen (falls nicht vorhanden)
+fs.mkdirSync(avatarDir, { recursive: true });
 
 const app = express();
 app.use(express.json());
@@ -23,7 +27,7 @@ const botRooms = new Map();
 // AVATAR UPLOAD
 // =============================
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, path.join(__dirname, "avatars")),
+    destination: (req, file, cb) => cb(null, avatarDir),
     filename: (req, file, cb) => {
         console.log("BODY:", req.body); // DEBUG
 
@@ -39,7 +43,7 @@ app.post("/upload-avatar", upload.single("avatar"), (req, res) => {
     const url = `https://${req.get("host")}/avatars/${req.file.filename}`;
     res.json({ url });
 });
-app.use("/avatars", express.static(path.join(__dirname, "avatars")));
+app.use("/avatars", express.static(path.join(avatarDir)));
 
 // =============================
 // SOCKET SERVER
