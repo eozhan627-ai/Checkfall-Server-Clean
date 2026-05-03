@@ -159,7 +159,7 @@ io.on("connection", (socket) => {
             white: botIsWhite ? "bot" : socket.id,
             black: botIsWhite ? socket.id : "bot",
             whiteName: botIsWhite ? "Stockfish" : name,
-            blackName: botIsWhite ? "Stockfish" : name,
+            blackName: botIsWhite ? name : "Stockfish",
             whiteAvatar: "",
             blackAvatar: avatar || "",
         });
