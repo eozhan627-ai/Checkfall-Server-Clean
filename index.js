@@ -184,15 +184,10 @@ io.on("connection", (socket) => {
     socket.on("player_move", async ({ roomId, move }) => {
 
 
-
         const botState = botRooms.get(roomId);
-        if (!botState) return;
-
-
-        if (botState.thinking) return;
-
         const isBotGame = !!botState;
 
+        if (isBotGame && botState.thinking) return;
 
 
         const game = botState?.game;
