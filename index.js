@@ -50,6 +50,17 @@ app.use("/avatars", express.static(path.join(avatarDir)));
 // =============================
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+
+function getOpponent(roomId, socketId) {
+    const room = io.sockets.adapter.rooms.get(roomId);
+    if (!room) return null;
+
+    for (const id of room) {
+        if (id !== socketId) return id;
+    }
+    return null;
+}
+
 function getEngine(botState) {
     if (botState.engine) {
         return botState.engine;
@@ -256,44 +267,45 @@ io.on("connection", (socket) => {
     // AUFGABE
     // =============================
     socket.on("resign_game", ({ roomId }) => {
-        const roomSockets = Array.from(io.sockets.adapter.rooms.get(roomId) || []);
-        const loserId = socket.id;
-        const winnerId = roomSockets.find(id => id !== loserId && io.sockets.sockets.has(id));
+        const opponentId = getOpponent(roomId, socket.id);
+        if (!opponentId) return;
 
-        if (!winnerId) return;
+        io.to(roomId).emit("game_over", {
+            type: "resign",
+            result: "draw",
+        });
 
-        io.to(loserId).emit("game_over", {
+        io.to(socket.id).emit("game_over", {
             type: "resign",
             result: "lost",
-            message: "Du hast aufgegeben. Dein Gegner gewinnt!",
         });
 
-        io.to(winnerId).emit("game_over", {
+        io.to(opponentId).emit("game_over", {
             type: "resign",
             result: "won",
-            message: "Dein Gegner hat aufgegeben. Du gewinnst!",
         });
+
         botRooms.delete(roomId);
     });
-
     // =============================
     // REMIS
     // =============================
     socket.on("offer_draw", ({ roomId }) => {
-        const roomSockets = Array.from(io.sockets.adapter.rooms.get(roomId) || []);
-        const opponentId = roomSockets.find(id => id !== socket.id && io.sockets.sockets.has(id));
-        if (opponentId) io.to(opponentId).emit("draw_offer");
-    });
+        const opponentId = getOpponent(roomId, socket.id);
+        if (!opponentId) return;
 
+        io.to(opponentId).emit("draw_offer");
+    });
     socket.on("answer_draw", ({ roomId, accept }) => {
-        const roomSockets = Array.from(io.sockets.adapter.rooms.get(roomId) || []);
-        const opponentId = roomSockets.find(id => id !== socket.id && io.sockets.sockets.has(id));
+        const opponentId = getOpponent(roomId, socket.id);
+        if (!opponentId) return;
 
         if (accept) {
-            if (opponentId) io.to(opponentId).emit("game_over", { type: "draw", message: "Remis vereinbart!" });
-            io.to(socket.id).emit("game_over", { type: "draw", message: "Remis vereinbart!" });
+            io.to(roomId).emit("game_over", {
+                type: "draw",
+            });
         } else {
-            if (opponentId) io.to(opponentId).emit("draw_declined");
+            io.to(opponentId).emit("draw_declined");
         }
     });
 
