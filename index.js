@@ -50,7 +50,7 @@ app.use("/avatars", express.static(path.join(avatarDir)));
 // =============================
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
-
+const socketToRoom = new Map();
 function getOpponent(roomId, socketId) {
     const room = io.sockets.adapter.rooms.get(roomId);
     if (!room) return null;
@@ -251,6 +251,9 @@ io.on("connection", (socket) => {
         socket.join(roomId);
         io.sockets.sockets.get(waitingPlayer.id)?.join(roomId);
 
+        socketToRoom.set(waitingPlayer.id, roomId);
+        socketToRoom.set(socket.id, roomId);
+
         io.to(roomId).emit("game_start", {
             roomId,
             white: waitingPlayer.id,
@@ -266,14 +269,12 @@ io.on("connection", (socket) => {
     // =============================
     // AUFGABE
     // =============================
-    socket.on("resign_game", ({ roomId }) => {
+    socket.on("resign_game", () => {
+        const roomId = socketToRoom.get(socket.id);
+        if (!roomId) return;
+
         const opponentId = getOpponent(roomId, socket.id);
         if (!opponentId) return;
-
-        io.to(roomId).emit("game_over", {
-            type: "resign",
-            result: "draw",
-        });
 
         io.to(socket.id).emit("game_over", {
             type: "resign",
@@ -285,7 +286,8 @@ io.on("connection", (socket) => {
             result: "won",
         });
 
-        botRooms.delete(roomId);
+        socketToRoom.delete(socket.id);
+        socketToRoom.delete(opponentId);
     });
     // =============================
     // REMIS
