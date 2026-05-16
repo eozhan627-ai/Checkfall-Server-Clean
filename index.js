@@ -314,33 +314,37 @@ io.on("connection", (socket) => {
     // =============================
     // DISCONNECT
     // =============================
-    socket.on("disconnect", () => {
-        console.log("Spieler getrennt:", socket.id);
+ socket.on("disconnect", () => {
+    console.log("Spieler getrennt:", socket.id);
 
-        if (waitingPlayer?.id === socket.id) {
-            waitingPlayer = null;
-            return;
-        }
+    // Warteschlange cleanup
+    if (waitingPlayer?.id === socket.id) {
+        waitingPlayer = null;
+        return;
+    }
 
-        const rooms = Array.from(socket.rooms).filter(r => r !== socket.id);
-        rooms.forEach(roomId => {
-            const roomSockets = Array.from(io.sockets.adapter.rooms.get(roomId) || []);
-            const opponentId = roomSockets.find(id => id !== socket.id && io.sockets.sockets.has(id));
+    const roomId = socketToRoom.get(socket.id);
 
-            if (opponentId) {
-                io.to(opponentId).emit("game_over", {
-                    type: "resign",
-                    result: "won",
-                    message: "Dein Gegner hat die App verlassen. Du gewinnst automatisch!",
-                });
-            }
+    if (!roomId) return;
 
+    const opponentId = getOpponent(roomId, socket.id);
+
+    if (opponentId) {
+        io.to(opponentId).emit("game_over", {
+            type: "disconnect",
+            result: "won",
+            message: "Dein Gegner hat das Spiel verlassen.",
         });
+
+        socketToRoom.delete(opponentId);
+    }
+
+    socketToRoom.delete(socket.id);
+
+    // optional Bot cleanup
+    botRooms.delete(roomId);
     });
-
-
 });
-
 // =============================
 // SERVER START
 // =============================
