@@ -140,6 +140,15 @@ function eloToSkill(level) {
             return 3;
     }
 }
+function getBlunderChance(level) {
+    switch (level) {
+        case 100: return 0.75;
+        case 300: return 0.3;
+        case 500: return 0.15;
+        case 1000: return 0.05;
+        default: return 0.2;
+    }
+}
 function eloToDepth(level) {
     switch (level) {
         case 100:
@@ -175,6 +184,40 @@ function startBotMove(roomId) {
     setTimeout(() => {
         const depth = eloToDepth(botState.level);
         const skill = eloToSkill(botState.level);
+        const blunderChance = getBlunderChance(botState.level);
+
+        if (Math.random() < blunderChance) {
+            const moves = botState.game.moves({ verbose: true });
+
+            if (moves.length > 0) {
+                const randomMoves = moves.filter(
+                    move =>
+                        !move.captured &&
+                        move.piece !== "q" &&
+                        move.piece !== "k"
+                );
+
+                const movePool =
+                    randomMoves.length > 0 ? randomMoves : moves;
+
+                const randomMove =
+                    movePool[Math.floor(Math.random() * movePool.length)];
+
+                botState.game.move(randomMove);
+
+                const moveString =
+                    randomMove.from +
+                    randomMove.to +
+                    (randomMove.promotion || "");
+
+                io.to(botState.roomId).emit("opponent_move", moveString);
+
+                botState.thinking = false;
+
+                console.log("🤡 RANDOM BLUNDER MOVE:", moveString);
+                return;
+            }
+        }
 
         console.log("BOT LEVEL:", botState.level);
         console.log("BOT DEPTH:", depth);
