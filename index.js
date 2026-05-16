@@ -237,12 +237,15 @@ io.on("connection", (socket) => {
     // BOT-MATCH 
     // =============================
     socket.on("find_bot_match", (data) => {
-        const { name, avatar, level } = data;
+        const { name, avatar, level, playerColor } = data;
 
         const roomId = `bot_${socket.id}`;
         socket.join(roomId);
 
-        const botIsWhite = Math.random() < 0.5;
+        const botIsWhite =
+            playerColor === "w" ? false :
+                playerColor === "b" ? true :
+                    Math.random() < 0.5;
 
         const game = new Chess();
 
