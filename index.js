@@ -122,6 +122,24 @@ function getEngine(botState) {
     botState.engine = engine;
     return engine;
 }
+function eloToSkill(level) {
+    switch (level) {
+        case 100:
+            return 0;
+
+        case 300:
+            return 3;
+
+        case 500:
+            return 6;
+
+        case 1000:
+            return 10;
+
+        default:
+            return 3;
+    }
+}
 function eloToDepth(level) {
     switch (level) {
         case 100:
@@ -156,10 +174,13 @@ function startBotMove(roomId) {
 
     setTimeout(() => {
         const depth = eloToDepth(botState.level);
+        const skill = eloToSkill(botState.level);
 
         console.log("BOT LEVEL:", botState.level);
         console.log("BOT DEPTH:", depth);
+        console.log("BOT SKILL:", skill);
 
+        engine.stdin.write(`setoption name Skill Level value ${skill}\n`);
         engine.stdin.write(`position fen ${botState.game.fen()}\n`);
         engine.stdin.write(`go depth ${depth}\n`);
     }, 500);
