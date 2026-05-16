@@ -122,6 +122,24 @@ function getEngine(botState) {
     botState.engine = engine;
     return engine;
 }
+function eloToDepth(level) {
+    switch (level) {
+        case 100:
+            return 2;
+
+        case 300:
+            return 4;
+
+        case 500:
+            return 6;
+
+        case 1000:
+            return 9;
+
+        default:
+            return 4;
+    }
+}
 function startBotMove(roomId) {
     const botState = botRooms.get(roomId);
     if (!botState) return;
@@ -137,8 +155,10 @@ function startBotMove(roomId) {
     botState.thinking = true;
 
     setTimeout(() => {
+        const depth = eloToDepth(botState.level);
+
         engine.stdin.write(`position fen ${botState.game.fen()}\n`);
-        engine.stdin.write(`go depth ${Math.min(botState.level, 12)}\n`);
+        engine.stdin.write(`go depth ${depth}\n`);
     }, 500);
 }
 let waitingPlayer = null;
@@ -314,35 +334,35 @@ io.on("connection", (socket) => {
     // =============================
     // DISCONNECT
     // =============================
- socket.on("disconnect", () => {
-    console.log("Spieler getrennt:", socket.id);
+    socket.on("disconnect", () => {
+        console.log("Spieler getrennt:", socket.id);
 
-    // Warteschlange cleanup
-    if (waitingPlayer?.id === socket.id) {
-        waitingPlayer = null;
-        return;
-    }
+        // Warteschlange cleanup
+        if (waitingPlayer?.id === socket.id) {
+            waitingPlayer = null;
+            return;
+        }
 
-    const roomId = socketToRoom.get(socket.id);
+        const roomId = socketToRoom.get(socket.id);
 
-    if (!roomId) return;
+        if (!roomId) return;
 
-    const opponentId = getOpponent(roomId, socket.id);
+        const opponentId = getOpponent(roomId, socket.id);
 
-    if (opponentId) {
-        io.to(opponentId).emit("game_over", {
-            type: "disconnect",
-            result: "won",
-            message: "Dein Gegner hat das Spiel verlassen.",
-        });
+        if (opponentId) {
+            io.to(opponentId).emit("game_over", {
+                type: "disconnect",
+                result: "won",
+                message: "Dein Gegner hat das Spiel verlassen.",
+            });
 
-        socketToRoom.delete(opponentId);
-    }
+            socketToRoom.delete(opponentId);
+        }
 
-    socketToRoom.delete(socket.id);
+        socketToRoom.delete(socket.id);
 
-    // optional Bot cleanup
-    botRooms.delete(roomId);
+        // optional Bot cleanup
+        botRooms.delete(roomId);
     });
 });
 // =============================
