@@ -157,6 +157,9 @@ function startBotMove(roomId) {
     setTimeout(() => {
         const depth = eloToDepth(botState.level);
 
+        console.log("BOT LEVEL:", botState.level);
+        console.log("BOT DEPTH:", depth);
+
         engine.stdin.write(`position fen ${botState.game.fen()}\n`);
         engine.stdin.write(`go depth ${depth}\n`);
     }, 500);
