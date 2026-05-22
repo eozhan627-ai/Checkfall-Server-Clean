@@ -40,7 +40,10 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 app.post("/upload-avatar", upload.single("avatar"), (req, res) => {
     if (!req.file) return res.status(400).json({ error: "Keine Datei" });
-    const url = `https://${req.get("host")}/avatars/${req.file.filename}`;
+
+    const BASE_URL = "https://checkfall-server-clean-1.onrender.com";
+
+    const url = `${BASE_URL}/avatars/${req.file.filename}`;
     res.json({ url });
 });
 app.use("/avatars", express.static(path.join(avatarDir)));
