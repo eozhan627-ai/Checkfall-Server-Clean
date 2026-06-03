@@ -329,11 +329,12 @@ io.on("connection", (socket) => {
     // MATCHMAKING
     // =============================
     socket.on("find_match", (data) => {
+        console.log("find_match Daten:", data);
         if (!data) return console.log("find_match ohne Daten");
 
         const { name, avatar } = data;
         const player = { id: socket.id, name, avatar };
-
+        console.log("Spieler sucht Match:", player);
         if (!waitingPlayer) {
             waitingPlayer = player;
             socket.emit("waiting");
@@ -347,6 +348,11 @@ io.on("connection", (socket) => {
         socketToRoom.set(waitingPlayer.id, roomId);
         socketToRoom.set(socket.id, roomId);
 
+        console.log("Game started:", {
+            roomId,
+            white: waitingPlayer.id,
+            black: socket.id,
+        });
         io.to(roomId).emit("game_start", {
             roomId,
             white: waitingPlayer.id,
