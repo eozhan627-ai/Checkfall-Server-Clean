@@ -308,15 +308,19 @@ io.on("connection", (socket) => {
             const result = game.move({
                 from: move.from,
                 to: move.to,
-                promotion: move.promotion
+                promotion: move.promotion || undefined,
             });
 
             if (!result) {
-                console.log("❌ INVALID PLAYER MOVE");
-                botState.thinking = false;
+                console.log("❌ INVALID PLAYER MOVE", move, game.fen());
+
                 return;
             }
-            socket.to(roomId).emit("opponent_move", move);
+            socket.to(roomId).emit("opponent_move", {
+                from: result.from,
+                to: result.to,
+                promotion: result.promotion,
+            });
         }
         if (isBotGame && game.turn() === botState.botColor && !botState.thinking) {
             console.log("🤖 Bot ist dran → starte Zug");
