@@ -371,28 +371,36 @@ io.on("connection", (socket) => {
     // AUFGABE
     // =============================
     socket.on("resign_game", () => {
+        console.log("RESIGN");
+        console.log("Player:", socket.id);
+
+
         const roomId = socketToRoom.get(socket.id);
+        console.log("Room:", roomId);
         if (!roomId) return;
 
         if (finishedGames.has(roomId)) return;
         finishedGames.add(roomId);
 
         const opponentId = getOpponent(roomId, socket.id);
+        console.log("Opponent:", opponentId);
         if (!opponentId) return;
 
         // Verlierer
         io.to(socket.id).emit("game_over", {
             roomId,
             type: "resign",
-            result: "lost",
+            winner: opponentId,
             loser: socket.id,
         });
+
 
         // Gewinner
         io.to(opponentId).emit("game_over", {
             roomId,
             type: "resign",
-            result: "won",
+            winner: opponentId,
+            loser: socket.id,
 
         });
 
@@ -455,7 +463,7 @@ io.on("connection", (socket) => {
             io.to(roomId).emit("game_over", {
                 roomId,
                 type: "disconnect",
-                result: "won",
+                winner: opponentId,
                 loser: socket.id,
 
             });
