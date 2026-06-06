@@ -103,9 +103,9 @@ function getEngine(botState) {
                 const game = botState.game;
 
                 const result = game.move({
-                    from: move.slice(0, 2),
-                    to: move.slice(2, 4),
-                    promotion: move.length > 4 ? move[4] : undefined
+                    from: move.from,
+                    to: move.to,
+                    promotion: move.promotion,
                 });
 
                 if (!result) {
@@ -113,8 +113,11 @@ function getEngine(botState) {
                     botState.thinking = false;
                     return;
                 }
-
-                io.to(botState.roomId).emit("opponent_move", move);
+                io.to(botState.roomId).emit("opponent_move", {
+                    from: result.from,
+                    to: result.to,
+                    promotion: move.length > 4 ? move[4] : undefined,
+                });
 
                 botState.thinking = false;
             }
@@ -214,7 +217,11 @@ function startBotMove(roomId) {
                     randomMove.to +
                     (randomMove.promotion || "");
 
-                io.to(botState.roomId).emit("opponent_move", moveString);
+                io.to(botState.roomId).emit("opponent_move", {
+                    from: randomMove.from,
+                    to: randomMove.to,
+                    promotion: randomMove.promotion,
+                });
 
                 botState.thinking = false;
 
@@ -299,9 +306,9 @@ io.on("connection", (socket) => {
 
         if (isBotGame && game) {
             const result = game.move({
-                from: move.slice(0, 2),
-                to: move.slice(2, 4),
-                promotion: move.length > 4 ? move[4] : undefined
+                from: move.from,
+                to: move.to,
+                promotion: move.promotion
             });
 
             if (!result) {
