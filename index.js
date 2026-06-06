@@ -309,8 +309,9 @@ io.on("connection", (socket) => {
                 botState.thinking = false;
                 return;
             }
+            socket.to(roomId).emit("opponent_move", move);
         }
-        if (isBotGame && game.turn() === botState.botColor) {
+        if (isBotGame && game.turn() === botState.botColor && !botState.thinking) {
             console.log("🤖 Bot ist dran → starte Zug");
             startBotMove(roomId);
         }
@@ -379,10 +380,20 @@ io.on("connection", (socket) => {
         const opponentId = getOpponent(roomId, socket.id);
         if (!opponentId) return;
 
-        io.to(roomId).emit("game_over", {
+        // Verlierer
+        io.to(socket.id).emit("game_over", {
+            roomId,
             type: "resign",
             result: "lost",
-            winner: opponentId,
+            loser: socket.id,
+        });
+
+        // Gewinner
+        io.to(opponentId).emit("game_over", {
+            roomId,
+            type: "resign",
+            result: "won",
+
         });
 
         socketToRoom.delete(socket.id);
@@ -408,6 +419,7 @@ io.on("connection", (socket) => {
             finishedGames.add(roomId);
 
             io.to(roomId).emit("game_over", {
+                roomId,
                 type: "draw",
                 result: "draw",
             });
@@ -441,8 +453,11 @@ io.on("connection", (socket) => {
 
         if (opponentId) {
             io.to(roomId).emit("game_over", {
+                roomId,
                 type: "disconnect",
                 result: "won",
+                loser: socket.id,
+
             });
 
             socketToRoom.delete(opponentId);
