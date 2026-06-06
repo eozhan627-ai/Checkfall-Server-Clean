@@ -53,6 +53,7 @@ app.use("/avatars", express.static(path.join(avatarDir)));
 // =============================
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+const finishedGames = new Set();
 const socketToRoom = new Map();
 function getOpponent(roomId, socketId) {
     const room = io.sockets.adapter.rooms.get(roomId);
@@ -372,21 +373,22 @@ io.on("connection", (socket) => {
         const roomId = socketToRoom.get(socket.id);
         if (!roomId) return;
 
+        if (finishedGames.has(roomId)) return;
+        finishedGames.add(roomId);
+
         const opponentId = getOpponent(roomId, socket.id);
         if (!opponentId) return;
 
-        io.to(socket.id).emit("game_over", {
+        io.to(roomId).emit("game_over", {
             type: "resign",
             result: "lost",
-        });
-
-        io.to(opponentId).emit("game_over", {
-            type: "resign",
-            result: "won",
+            winner: opponentId,
         });
 
         socketToRoom.delete(socket.id);
         socketToRoom.delete(opponentId);
+
+        botRooms.delete(roomId);
     });
     // =============================
     // REMIS
@@ -402,9 +404,17 @@ io.on("connection", (socket) => {
         if (!opponentId) return;
 
         if (accept) {
+            if (finishedGames.has(roomId)) return;
+            finishedGames.add(roomId);
+
             io.to(roomId).emit("game_over", {
                 type: "draw",
+                result: "draw",
             });
+
+            socketToRoom.delete(socket.id);
+            socketToRoom.delete(opponentId);
+            botRooms.delete(roomId);
         } else {
             io.to(opponentId).emit("draw_declined");
         }
@@ -416,31 +426,29 @@ io.on("connection", (socket) => {
     socket.on("disconnect", () => {
         console.log("Spieler getrennt:", socket.id);
 
-        // Warteschlange cleanup
         if (waitingPlayer?.id === socket.id) {
             waitingPlayer = null;
             return;
         }
 
         const roomId = socketToRoom.get(socket.id);
-
         if (!roomId) return;
+
+        if (finishedGames.has(roomId)) return;
+        finishedGames.add(roomId);
 
         const opponentId = getOpponent(roomId, socket.id);
 
         if (opponentId) {
-            io.to(opponentId).emit("game_over", {
+            io.to(roomId).emit("game_over", {
                 type: "disconnect",
                 result: "won",
-                message: "Dein Gegner hat das Spiel verlassen.",
             });
 
             socketToRoom.delete(opponentId);
         }
 
         socketToRoom.delete(socket.id);
-
-        // optional Bot cleanup
         botRooms.delete(roomId);
     });
 });
