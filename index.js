@@ -293,49 +293,61 @@ io.on("connection", (socket) => {
     // =============================
     // SPIELERZUG (PvP)
     // =============================
-    socket.on("player_move", async ({ roomId, move }) => {
+    socket.on("player_move", ({ roomId, move } = {}) => {
 
+        console.log("📨 RECEIVED MOVE:", { roomId, move });
+
+        // Schutz gegen leere Daten
+        if (!roomId || !move?.from || !move?.to) {
+            console.log("❌ INVALID MOVE RECEIVED:", move);
+            return;
+        }
 
         const botState = botRooms.get(roomId);
         const isBotGame = !!botState;
 
-        if (isBotGame && botState.thinking) return;
-
+        if (isBotGame && botState.thinking) {
+            return;
+        }
 
         const game = botState?.game;
 
+        // ===== BOT GAME =====
         if (isBotGame && game) {
-            const result = game.move({
-                from: move.from,
-                to: move.to,
-                promotion: move.promotion || undefined,
-            });
 
-            if (!result) {
-                console.log("❌ INVALID PLAYER MOVE", move, game.fen());
+            let result;
 
+            try {
+                result = game.move({
+                    from: move.from,
+                    to: move.to,
+                    promotion: move.promotion || undefined,
+                });
+            } catch (err) {
+                console.log("❌ CHESS.JS ERROR:", move);
+                console.error(err);
                 return;
             }
+
             socket.to(roomId).emit("opponent_move", {
                 from: result.from,
                 to: result.to,
                 promotion: result.promotion,
             });
-        }
-        if (isBotGame && game.turn() === botState.botColor && !botState.thinking) {
-            console.log("🤖 Bot ist dran → starte Zug");
-            startBotMove(roomId);
+
+            if (
+                game.turn() === botState.botColor &&
+                !botState.thinking
+            ) {
+                console.log("🤖 Bot ist dran → starte Zug");
+                startBotMove(roomId);
+            }
+
+            return;
         }
 
-        if (!isBotGame) {
-            socket.to(roomId).emit("opponent_move", move);
-        }
-
-        console.log("📦 BOT STATE:", botState);
-        console.log("🤖 isBotGame:", isBotGame);
-
-        if (!isBotGame) return;
-        console.log("🚀 STARTING STOCKFISH");
+        // ===== PvP =====
+        socket.to(roomId).emit("opponent_move", move);
 
     });
     // =============================
