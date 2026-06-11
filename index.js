@@ -99,24 +99,33 @@ function getEngine(botState) {
                 }
             }
             if (line.startsWith("bestmove")) {
-                const move = line.split(" ")[1];
-                const game = botState.game;
+                const uci = line.split(" ")[1];
 
-                const result = game.move({
-                    from: move.from,
-                    to: move.to,
-                    promotion: move.promotion,
-                });
-
-                if (!result) {
-                    console.log("❌ STOCKFISH INVALID MOVE:", move);
+                if (!uci || uci === "(none)") {
                     botState.thinking = false;
                     return;
                 }
+
+                const from = uci.slice(0, 2);
+                const to = uci.slice(2, 4);
+                const promotion = uci[4];
+
+                const result = botState.game.move({
+                    from,
+                    to,
+                    promotion,
+                });
+
+                if (!result) {
+                    console.log("❌ STOCKFISH INVALID MOVE:", uci);
+                    botState.thinking = false;
+                    return;
+                }
+
                 io.to(botState.roomId).emit("opponent_move", {
                     from: result.from,
                     to: result.to,
-                    promotion: move.length > 4 ? move[4] : undefined,
+                    promotion: result.promotion,
                 });
 
                 botState.thinking = false;
