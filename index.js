@@ -280,6 +280,29 @@ io.on("connection", (socket) => {
     // BOT MOVE FROM PLAYER
     // =============================
     socket.on("player_move", ({ roomId, move }) => {
+        const g = games.get(roomId);
+
+        if (g) {
+            const result = g.game.move(move);
+            if (!result) return;
+
+            g.activeColor = g.activeColor === "w" ? "b" : "w";
+
+            io.to(roomId).emit("opponent_move", {
+                from: result.from,
+                to: result.to,
+                promotion: result.promotion
+            });
+
+            io.to(roomId).emit("timer_update", {
+                whiteTime: g.whiteTime,
+                blackTime: g.blackTime,
+                activeColor: g.activeColor
+            });
+
+            return;
+        }
+
         const botState = botGames.get(roomId);
         if (!botState) return;
 
