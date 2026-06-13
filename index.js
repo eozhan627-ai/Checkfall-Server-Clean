@@ -196,9 +196,7 @@ function startBotMove(roomId) {
     }
 
     botState.thinking = true;
-    setTimeout(() => {
-        botState.thinking = false;
-    }, 5000);
+
     setTimeout(() => {
         const depth = eloToDepth(botState.level);
         const skill = eloToSkill(botState.level);
@@ -305,12 +303,21 @@ io.on("connection", (socket) => {
     // SPIELERZUG (PvP)
     // =============================
     socket.on("player_move", ({ roomId, move }) => {
+        console.log("📨 RECEIVED MOVE:", { roomId, move });
+
+        if (!roomId || typeof move !== "string") {
+            console.log("❌ INVALID MOVE RECEIVED:", move);
+            return;
+        }
+
         const botState = botRooms.get(roomId);
         if (!botState) return;
 
         const game = botState.game;
 
-        const { from, to, promotion } = move;
+        const from = move.slice(0, 2);
+        const to = move.slice(2, 4);
+        const promotion = move[4];
 
         const result = game.move({
             from,
