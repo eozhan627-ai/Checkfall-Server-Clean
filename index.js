@@ -187,13 +187,29 @@ io.on("connection", (socket) => {
     // PvP MOVE FIX
     // =============================
     socket.on("player_move", ({ roomId, move }) => {
+        console.log("MOVE RECEIVED:", move);
+
         const game = games.get(roomId);
-        if (!game) return;
+
+        if (!game) {
+            console.log("NO GAME FOR ROOM:", roomId);
+            return;
+        }
+
+        console.log("SERVER FEN BEFORE:", game.fen());
 
         const { from, to, promotion } = move;
 
         const result = game.move({ from, to, promotion });
-        if (!result) return;
+
+        console.log("RESULT:", result);
+
+        if (!result) {
+            console.log("ILLEGAL MOVE:", move);
+            return;
+        }
+
+        console.log("SERVER FEN AFTER:", game.fen());
 
         socket.to(roomId).emit("opponent_move", {
             from: result.from,
@@ -201,7 +217,6 @@ io.on("connection", (socket) => {
             promotion: result.promotion,
         });
     });
-
     // =============================
     // BOT MATCH
     // =============================
