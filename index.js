@@ -237,6 +237,9 @@ io.on("connection", (socket) => {
         const g = games.get(roomId);
         if (!g) return;
 
+        const result = g.game.move(move);
+        if (!result) return;
+
         const now = Date.now();
         const diff = now - g.lastTick;
 
@@ -249,10 +252,6 @@ io.on("connection", (socket) => {
         }
 
         g.lastTick = now;
-
-        const result = g.game.move(move);
-        if (!result) return;
-
         g.activeColor = g.activeColor === "w" ? "b" : "w";
 
         io.to(roomId).emit("opponent_move", {
@@ -273,50 +272,6 @@ io.on("connection", (socket) => {
             });
 
             games.delete(roomId);
-        }
-    });
-
-    // =============================
-    // BOT MOVE FROM PLAYER
-    // =============================
-    socket.on("player_move", ({ roomId, move }) => {
-        const g = games.get(roomId);
-
-        if (g) {
-            const result = g.game.move(move);
-            if (!result) return;
-
-            g.activeColor = g.activeColor === "w" ? "b" : "w";
-
-            io.to(roomId).emit("opponent_move", {
-                from: result.from,
-                to: result.to,
-                promotion: result.promotion
-            });
-
-            io.to(roomId).emit("timer_update", {
-                whiteTime: g.whiteTime,
-                blackTime: g.blackTime,
-                activeColor: g.activeColor
-            });
-
-            return;
-        }
-
-        const botState = botGames.get(roomId);
-        if (!botState) return;
-
-        const result = botState.game.move(move);
-        if (!result) return;
-
-        socket.to(roomId).emit("opponent_move", {
-            from: result.from,
-            to: result.to,
-            promotion: result.promotion
-        });
-
-        if (botState.game.turn() === botState.botColor) {
-            startBotMove(roomId);
         }
     });
 
@@ -353,7 +308,6 @@ io.on("connection", (socket) => {
         socketToRoom.delete(socket.id);
     });
 });
-
 // =============================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log("Server running on", PORT));
