@@ -10,50 +10,46 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-/* =========================
-   STATE
-========================= */
-
-const games = new Map();
-const botGames = new Map();
+// =============================
+// STATE
+// =============================
+const games = new Map();        // PvP
+const botGames = new Map();     // Bot
 const socketToRoom = new Map();
 let waitingPlayer = null;
 
-/* =========================
-   PVP GAME
-========================= */
-
+// =============================
+// GAME FACTORY (PvP)
+// =============================
 function createPvPGame() {
     return {
         game: new Chess(),
         whiteTime: 300000,
         blackTime: 300000,
         increment: 2000,
-        active: "w",
+        activeColor: "w",
         lastTick: Date.now(),
-        players: { w: null, b: null },
+        players: { w: null, b: null }
     };
 }
 
-/* =========================
-   BOT GAME
-========================= */
-
+// =============================
+// BOT GAME FACTORY
+// =============================
 function createBotGame(level = 300) {
     return {
         game: new Chess(),
         level,
         botColor: "b",
-        engine: null,
-        ready: false,
         thinking: false,
+        engine: null,
+        engineReady: false
     };
 }
 
-/* =========================
-   TIMER
-========================= */
-
+// =============================
+// TIMER (PvP ONLY)
+// =============================
 setInterval(() => {
     const now = Date.now();
 
@@ -61,7 +57,7 @@ setInterval(() => {
         const diff = now - g.lastTick;
         g.lastTick = now;
 
-        if (g.active === "w") g.whiteTime -= diff;
+        if (g.activeColor === "w") g.whiteTime -= diff;
         else g.blackTime -= diff;
 
         if (g.whiteTime <= 0 || g.blackTime <= 0) {
@@ -69,7 +65,7 @@ setInterval(() => {
 
             io.to(roomId).emit("game_over", {
                 type: "timeout",
-                winner,
+                winner
             });
 
             games.delete(roomId);
@@ -79,20 +75,21 @@ setInterval(() => {
         io.to(roomId).emit("timer_update", {
             whiteTime: g.whiteTime,
             blackTime: g.blackTime,
-            activeColor: g.active,
+            activeColor: g.activeColor
         });
     }
 }, 1000);
 
-/* =========================
-   STOCKFISH ENGINE
-========================= */
-
+// =============================
+// STOCKFISH (BOT ENGINE)
+// =============================
 function getEngine(botState, roomId) {
     if (botState.engine) return botState.engine;
 
     const engine = spawn("/usr/games/stockfish");
     let buffer = "";
+
+    botState.engineReady = false;
 
     engine.stdout.on("data", (data) => {
         buffer += data.toString();
@@ -105,7 +102,7 @@ function getEngine(botState, roomId) {
             if (line === "uciok") engine.stdin.write("isready\n");
 
             if (line === "readyok") {
-                botState.ready = true;
+                botState.engineReady = true;
                 if (botState.game.turn() === botState.botColor) {
                     startBotMove(roomId);
                 }
@@ -119,13 +116,13 @@ function getEngine(botState, roomId) {
                 const to = uci.slice(2, 4);
                 const promotion = uci[4];
 
-                const move = botState.game.move({ from, to, promotion });
-                if (!move) return;
+                const result = botState.game.move({ from, to, promotion });
+                if (!result) return;
 
                 io.to(roomId).emit("opponent_move", {
-                    from: move.from,
-                    to: move.to,
-                    promotion: move.promotion,
+                    from: result.from,
+                    to: result.to,
+                    promotion: result.promotion
                 });
 
                 botState.thinking = false;
@@ -143,7 +140,7 @@ function startBotMove(roomId) {
     if (!botState || botState.thinking) return;
 
     const engine = getEngine(botState, roomId);
-    if (!botState.ready) return;
+    if (!botState.engineReady) return;
 
     botState.thinking = true;
 
@@ -153,31 +150,33 @@ function startBotMove(roomId) {
     }, 300);
 }
 
-/* =========================
-   SOCKET
-========================= */
-
+// =============================
+// SOCKET
+// =============================
 io.on("connection", (socket) => {
 
-    /* ========= MATCHMAKING ========= */
-    socket.on("find_match", (data) => {
+    console.log("Connected:", socket.id);
 
+    // =============================
+    // PvP MATCHMAKING
+    // =============================
+    socket.on("find_match", (data) => {
         if (!waitingPlayer) {
-            waitingPlayer = { id: socket.id, name: data?.name };
+            waitingPlayer = { id: socket.id, ...data };
             socket.emit("waiting");
             return;
         }
 
         const roomId = `${waitingPlayer.id}_${socket.id}`;
 
+        socket.join(roomId);
+        io.sockets.sockets.get(waitingPlayer.id)?.join(roomId);
+
         const game = createPvPGame();
         game.players.w = waitingPlayer.id;
         game.players.b = socket.id;
 
         games.set(roomId, game);
-
-        socket.join(roomId);
-        io.sockets.sockets.get(waitingPlayer.id)?.join(roomId);
 
         socketToRoom.set(waitingPlayer.id, roomId);
         socketToRoom.set(socket.id, roomId);
@@ -188,37 +187,40 @@ io.on("connection", (socket) => {
             black: socket.id,
             whiteName: waitingPlayer.name,
             blackName: data.name,
+
             whiteTime: game.whiteTime,
             blackTime: game.blackTime,
-            increment: game.increment,
+            increment: game.increment
         });
 
         waitingPlayer = null;
     });
 
-    /* ========= BOT MATCH ========= */
+    // =============================
+    // BOT MATCH
+    // =============================
     socket.on("find_bot_match", (data) => {
-
         const roomId = `bot_${socket.id}`;
         socket.join(roomId);
 
+        const game = new Chess();
+
         const botState = createBotGame(data.level);
 
-        const game = new Chess();
         botState.game = game;
+        botGames.set(roomId, botState);
+
+        socketToRoom.set(socket.id, roomId);
 
         const botIsWhite = Math.random() < 0.5;
         botState.botColor = botIsWhite ? "w" : "b";
-
-        botGames.set(roomId, botState);
-        socketToRoom.set(socket.id, roomId);
 
         io.to(roomId).emit("game_start", {
             roomId,
             white: botIsWhite ? "bot" : socket.id,
             black: botIsWhite ? socket.id : "bot",
             whiteName: botIsWhite ? "Stockfish" : data.name,
-            blackName: botIsWhite ? data.name : "Stockfish",
+            blackName: botIsWhite ? data.name : "Stockfish"
         });
 
         getEngine(botState, roomId);
@@ -228,114 +230,122 @@ io.on("connection", (socket) => {
         }
     });
 
-    /* ========= MOVE ========= */
+    // =============================
+    // PvP MOVE
+    // =============================
     socket.on("player_move", ({ roomId, move }) => {
+        const g = games.get(roomId);
+        if (!g) return;
 
-        /* ===== PVP ===== */
+        const now = Date.now();
+        const diff = now - g.lastTick;
+
+        if (g.activeColor === "w") {
+            g.whiteTime -= diff;
+            g.whiteTime += g.increment;
+        } else {
+            g.blackTime -= diff;
+            g.blackTime += g.increment;
+        }
+
+        g.lastTick = now;
+
+        const result = g.game.move(move);
+        if (!result) return;
+
+        g.activeColor = g.activeColor === "w" ? "b" : "w";
+
+        io.to(roomId).emit("opponent_move", {
+            from: result.from,
+            to: result.to,
+            promotion: result.promotion
+        });
+
+        io.to(roomId).emit("timer_update", {
+            whiteTime: g.whiteTime,
+            blackTime: g.blackTime,
+            activeColor: g.activeColor
+        });
+
+        if (g.game.isGameOver()) {
+            io.to(roomId).emit("game_over", {
+                type: g.game.isCheckmate() ? "checkmate" : "draw"
+            });
+
+            games.delete(roomId);
+        }
+    });
+
+    // =============================
+    // BOT MOVE FROM PLAYER
+    // =============================
+    socket.on("player_move", ({ roomId, move }) => {
         const g = games.get(roomId);
 
         if (g) {
-
-            const color =
-                socket.id === g.white ? "w" :
-                    socket.id === g.black ? "b" :
-                        null;
-
-            if (!color || color !== g.active) return;
-
-            const now = Date.now();
-            const diff = now - g.lastTick;
-            g.lastTick = now;
-
-            if (g.active === "w") {
-                g.whiteTime += g.increment - diff;
-            } else {
-                g.blackTime += g.increment - diff;
-            }
-
-            let result;
-            try {
-                result = g.game.move(move);
-            } catch {
-                return;
-            }
-
+            const result = g.game.move(move);
             if (!result) return;
 
-            g.active = g.active === "w" ? "b" : "w";
+            g.activeColor = g.activeColor === "w" ? "b" : "w";
 
             io.to(roomId).emit("opponent_move", {
                 from: result.from,
                 to: result.to,
-                promotion: result.promotion,
+                promotion: result.promotion
             });
 
             io.to(roomId).emit("timer_update", {
                 whiteTime: g.whiteTime,
                 blackTime: g.blackTime,
-                activeColor: g.active,
+                activeColor: g.activeColor
             });
 
-            if (g.game.isGameOver()) {
-                io.to(roomId).emit("game_over", {
-                    type: g.game.isCheckmate() ? "checkmate" : "draw",
-                });
-
-                games.delete(roomId);
-            }
-
             return;
         }
 
-        /* ===== BOT ===== */
-        const bot = botGames.get(roomId);
-        if (!bot) return;
+        const botState = botGames.get(roomId);
+        if (!botState) return;
 
-        try {
-            bot.game.move(move);
-        } catch {
-            return;
-        }
+        const result = botState.game.move(move);
+        if (!result) return;
 
-        if (bot.game.turn() === bot.botColor) {
+        socket.to(roomId).emit("opponent_move", {
+            from: result.from,
+            to: result.to,
+            promotion: result.promotion
+        });
+
+        if (botState.game.turn() === botState.botColor) {
             startBotMove(roomId);
         }
     });
 
-    /* ========= RESIGN ========= */
+    // =============================
+    // RESIGN
+    // =============================
     socket.on("resign_game", ({ roomId }) => {
         const g = games.get(roomId);
+        if (g) games.delete(roomId);
 
-        if (g) {
-            const winner =
-                socket.id === g.white ? g.black : g.white;
+        const bot = botGames.get(roomId);
+        if (bot) botGames.delete(roomId);
 
-            io.to(roomId).emit("game_over", {
-                type: "resign",
-                winner,
-            });
-
-            games.delete(roomId);
-        }
-
-        botGames.delete(roomId);
+        io.to(roomId).emit("game_over", {
+            type: "resign",
+            winner: "opponent"
+        });
     });
 
-    /* ========= DISCONNECT ========= */
+    // =============================
+    // DISCONNECT
+    // =============================
     socket.on("disconnect", () => {
-
         const roomId = socketToRoom.get(socket.id);
         if (!roomId) return;
 
-        const g = games.get(roomId);
-        if (!g) return;
-
-        const winner =
-            socket.id === g.white ? g.black : g.white;
-
         io.to(roomId).emit("game_over", {
             type: "disconnect",
-            winner,
+            winner: "opponent"
         });
 
         games.delete(roomId);
@@ -344,4 +354,6 @@ io.on("connection", (socket) => {
     });
 });
 
-server.listen(3000, () => console.log("server running"));
+// =============================
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log("Server running on", PORT));
