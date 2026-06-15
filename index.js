@@ -61,17 +61,19 @@ setInterval(() => {
         else g.blackTime -= diff;
 
         if (g.whiteTime <= 0 || g.blackTime <= 0) {
-            const winner = g.whiteTime <= 0 ? "b" : "w";
+            const winnerSocket =
+                g.whiteTime <= 0
+                    ? g.players.b
+                    : g.players.w;
 
             io.to(roomId).emit("game_over", {
                 type: "timeout",
-                winner
+                winner: winnerSocket,
             });
 
             games.delete(roomId);
             continue;
         }
-
         io.to(roomId).emit("timer_update", {
             whiteTime: g.whiteTime,
             blackTime: g.blackTime,
@@ -267,10 +269,21 @@ io.on("connection", (socket) => {
         });
 
         if (g.game.isGameOver()) {
-            io.to(roomId).emit("game_over", {
-                type: g.game.isCheckmate() ? "checkmate" : "draw"
-            });
+            if (g.game.isCheckmate()) {
+                const winner =
+                    g.game.turn() === "w"
+                        ? g.players.b
+                        : g.players.w;
 
+                io.to(roomId).emit("game_over", {
+                    type: "checkmate",
+                    winner,
+                });
+            } else {
+                io.to(roomId).emit("game_over", {
+                    type: "draw",
+                });
+            }
             games.delete(roomId);
         }
     });
@@ -280,28 +293,40 @@ io.on("connection", (socket) => {
     // =============================
     socket.on("resign_game", ({ roomId }) => {
         const g = games.get(roomId);
-        if (g) games.delete(roomId);
 
-        const bot = botGames.get(roomId);
-        if (bot) botGames.delete(roomId);
+        if (!g) return;
+
+        const winner =
+            socket.id === g.players.w
+                ? g.players.b
+                : g.players.w;
 
         io.to(roomId).emit("game_over", {
             type: "resign",
-            winner: "opponent"
+            winner,
         });
-    });
 
+        games.delete(roomId);
+    });
     // =============================
     // DISCONNECT
     // =============================
     socket.on("disconnect", () => {
         const roomId = socketToRoom.get(socket.id);
         if (!roomId) return;
+        const g = games.get(roomId);
 
-        io.to(roomId).emit("game_over", {
-            type: "disconnect",
-            winner: "opponent"
-        });
+        if (g) {
+            const winner =
+                socket.id === g.players.w
+                    ? g.players.b
+                    : g.players.w;
+
+            io.to(roomId).emit("game_over", {
+                type: "disconnect",
+                winner,
+            });
+        }
 
         games.delete(roomId);
         botGames.delete(roomId);
