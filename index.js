@@ -128,6 +128,7 @@ function getEngine(botState, roomId) {
                 });
 
                 botState.thinking = false;
+                botState.pending = false;
             }
         }
     });
@@ -141,9 +142,12 @@ function startBotMove(roomId) {
     const botState = botGames.get(roomId);
     if (!botState || botState.thinking) return;
 
+    if (botState.pending) return;
+
     const engine = getEngine(botState, roomId);
     if (!botState.engineReady) return;
 
+    botState.pending = true;
     botState.thinking = true;
 
     setTimeout(() => {
