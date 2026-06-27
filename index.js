@@ -236,6 +236,38 @@ io.on("connection", (socket) => {
     // PvP MOVE
     // =============================
     socket.on("player_move", ({ roomId, move }) => {
+
+        // ===== BOT =====
+
+        const bot = botGames.get(roomId);
+
+        if (bot) {
+
+            const result = bot.game.move(move);
+
+            if (!result) return;
+
+            io.to(roomId).emit("opponent_move", {
+
+                from: result.from,
+
+                to: result.to,
+
+                promotion: result.promotion
+
+            });
+
+            if (!bot.game.isGameOver()) {
+
+                startBotMove(roomId);
+
+            }
+
+            return;
+
+        }
+
+
         const g = games.get(roomId);
         if (!g) return;
 
