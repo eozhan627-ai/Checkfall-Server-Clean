@@ -251,7 +251,7 @@ io.on("connection", (socket) => {
 
             if (!result) return;
 
-            io.to(roomId).emit("opponent_move", {
+            socket.to(roomId).emit("opponent_move", {
 
                 from: result.from,
 
