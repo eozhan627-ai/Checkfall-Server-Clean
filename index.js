@@ -3,9 +3,23 @@ import express from "express";
 import { Server } from "socket.io";
 import { Chess } from "chess.js";
 import { spawn } from "child_process";
+import multer from "multer";
+import { v2 as cloudinary } from "cloudinary";
 
 const app = express();
 app.use(express.json());
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 5 * 1024 * 1024,
+    },
+});
+
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
@@ -155,7 +169,52 @@ function startBotMove(roomId) {
         engine.stdin.write(`go depth 5\n`);
     }, 300);
 }
+app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                error: "No avatar uploaded",
+            });
+        }
 
+        if (!req.body.userId) {
+            return res.status(400).json({
+                error: "Missing userId",
+            });
+        }
+
+        const result = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+                {
+                    folder: "checkfall/avatars",
+                    public_id: req.body.userId,
+                    overwrite: true,
+                    resource_type: "image",
+                },
+                (error, result) => {
+                    if (error) reject(error);
+                    else resolve(result);
+                }
+            );
+
+            stream.end(req.file.buffer);
+        });
+
+        console.log("AVATAR UPLOADED:", result.secure_url);
+
+        res.json({
+            success: true,
+            url: result.secure_url,
+        });
+
+    } catch (error) {
+        console.error("AVATAR UPLOAD ERROR:", error);
+
+        res.status(500).json({
+            error: "Avatar upload failed",
+        });
+    }
+});
 // =============================
 // SOCKET
 // =============================
