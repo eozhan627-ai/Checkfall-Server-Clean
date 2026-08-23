@@ -254,10 +254,15 @@ io.on("connection", (socket) => {
 
         io.to(roomId).emit("game_start", {
             roomId,
+
             white: waitingPlayer.id,
             black: socket.id,
+
             whiteName: waitingPlayer.name,
             blackName: data.name,
+
+            whiteAvatar: waitingPlayer.avatar || "",
+            blackAvatar: data.avatar || "",
 
             whiteTime: game.whiteTime,
             blackTime: game.blackTime,
