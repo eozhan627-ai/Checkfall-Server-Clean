@@ -167,6 +167,12 @@ io.on("connection", (socket) => {
     // PvP MATCHMAKING
     // =============================
     socket.on("find_match", (data) => {
+
+        if (waitingPlayer?.id === socket.id) {
+            console.log("Already waiting:", socket.id);
+            return;
+        }
+
         if (!waitingPlayer) {
             waitingPlayer = { id: socket.id, ...data };
             socket.emit("waiting");
@@ -270,10 +276,23 @@ io.on("connection", (socket) => {
             return;
 
         }
-
-
         const g = games.get(roomId);
         if (!g) return;
+
+        // Prüfen, ob der Spieler überhaupt am Zug ist
+        const expectedPlayer =
+            g.activeColor === "w"
+                ? g.players.w
+                : g.players.b;
+
+        if (socket.id !== expectedPlayer) {
+            console.log("Move rejected: not player's turn", {
+                socket: socket.id,
+                expectedPlayer,
+                activeColor: g.activeColor
+            });
+            return;
+        }
 
         const result = g.game.move(move);
         if (!result) return;
@@ -292,18 +311,19 @@ io.on("connection", (socket) => {
         g.lastTick = now;
         g.activeColor = g.activeColor === "w" ? "b" : "w";
 
-        io.to(roomId).emit("opponent_move", {
+        // NUR der Gegner bekommt den Zug
+        socket.to(roomId).emit("opponent_move", {
             from: result.from,
             to: result.to,
             promotion: result.promotion
         });
 
+        // Beide bekommen den Timer
         io.to(roomId).emit("timer_update", {
             whiteTime: g.whiteTime,
             blackTime: g.blackTime,
             activeColor: g.activeColor
         });
-
         if (g.game.isGameOver()) {
             if (g.game.isCheckmate()) {
                 const winner =
@@ -348,8 +368,20 @@ io.on("connection", (socket) => {
     // DISCONNECT
     // =============================
     socket.on("disconnect", () => {
+        console.log("Disconnected:", socket.id);
+
+        // Spieler aus der Matchmaking-Warteschlange entfernen
+        if (waitingPlayer?.id === socket.id) {
+            waitingPlayer = null;
+            console.log("Removed disconnected player from waiting queue");
+        }
+
         const roomId = socketToRoom.get(socket.id);
-        if (!roomId) return;
+
+        if (!roomId) {
+            return;
+        }
+
         const g = games.get(roomId);
 
         if (g) {
@@ -362,9 +394,10 @@ io.on("connection", (socket) => {
                 type: "disconnect",
                 winner,
             });
+
+            games.delete(roomId);
         }
 
-        games.delete(roomId);
         botGames.delete(roomId);
         socketToRoom.delete(socket.id);
     });
