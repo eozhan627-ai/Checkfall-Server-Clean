@@ -407,7 +407,72 @@ io.on("connection", (socket) => {
             games.delete(roomId);
         }
     });
+    // =============================
+    // DRAW OFFER
+    // =============================
+    socket.on("offer_draw", ({ roomId }) => {
+        const g = games.get(roomId);
 
+        if (!g) return;
+
+        // Nur Spieler aus dieser Partie dürfen Remis anbieten
+        if (
+            socket.id !== g.players.w &&
+            socket.id !== g.players.b
+        ) {
+            return;
+        }
+
+        const opponent =
+            socket.id === g.players.w
+                ? g.players.b
+                : g.players.w;
+
+        console.log("DRAW OFFER:", {
+            from: socket.id,
+            opponent,
+            roomId,
+        });
+
+        io.to(opponent).emit("draw_offer");
+    });
+
+
+    // =============================
+    // DRAW ANSWER
+    // =============================
+    socket.on("answer_draw", ({ roomId, accept }) => {
+        const g = games.get(roomId);
+
+        if (!g) return;
+
+        // Nur Spieler aus dieser Partie dürfen antworten
+        if (
+            socket.id !== g.players.w &&
+            socket.id !== g.players.b
+        ) {
+            return;
+        }
+
+        if (accept) {
+            console.log("DRAW ACCEPTED:", roomId);
+
+            io.to(roomId).emit("game_over", {
+                type: "draw",
+            });
+
+            games.delete(roomId);
+        } else {
+            console.log("DRAW DECLINED:", roomId);
+
+            const opponent =
+                socket.id === g.players.w
+                    ? g.players.b
+                    : g.players.w;
+
+            io.to(opponent).emit("draw_declined");
+        }
+    });
     // =============================
     // RESIGN
     // =============================
