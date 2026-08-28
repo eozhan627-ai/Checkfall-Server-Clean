@@ -279,29 +279,92 @@ io.on("connection", (socket) => {
         const roomId = `bot_${socket.id}`;
         socket.join(roomId);
 
-        const game = new Chess();
+        // ==========================================
+        // FARBE BESTIMMEN
+        // ==========================================
+
+        let botIsWhite;
+
+        if (data.playerColor === "w") {
+            // Spieler will Weiß -> Bot muss Schwarz sein
+            botIsWhite = false;
+        } else if (data.playerColor === "b") {
+            // Spieler will Schwarz -> Bot muss Weiß sein
+            botIsWhite = true;
+        } else {
+            // Random
+            botIsWhite = Math.random() < 0.5;
+        }
+
+        const playerIsWhite = !botIsWhite;
+
+        // ==========================================
+        // STARTPOSITION / SAVED GAME
+        // ==========================================
+
+        let game;
+
+        try {
+            if (data.startFEN && data.startFEN !== "startpos") {
+                game = new Chess(data.startFEN);
+            } else {
+                game = new Chess();
+            }
+        } catch (error) {
+            console.error("❌ Invalid startFEN:", data.startFEN);
+            game = new Chess();
+        }
+
+        // ==========================================
+        // BOT STATE
+        // ==========================================
 
         const botState = createBotGame(data.level);
 
         botState.game = game;
-        botGames.set(roomId, botState);
+        botState.botColor = botIsWhite ? "w" : "b";
 
+        botGames.set(roomId, botState);
         socketToRoom.set(socket.id, roomId);
 
-        const botIsWhite = Math.random() < 0.5;
-        botState.botColor = botIsWhite ? "w" : "b";
+        // ==========================================
+        // GAME START
+        // ==========================================
 
         io.to(roomId).emit("game_start", {
             roomId,
+
             white: botIsWhite ? "bot" : socket.id,
             black: botIsWhite ? socket.id : "bot",
+
             whiteName: botIsWhite ? "Stockfish" : data.name,
-            blackName: botIsWhite ? data.name : "Stockfish"
+            blackName: botIsWhite ? data.name : "Stockfish",
+
+            // WICHTIG für Client
+            playerColor: playerIsWhite ? "w" : "b",
+            botColor: botState.botColor,
+
+            // WICHTIG für Saved Games
+            fen: game.fen()
         });
+
+        console.log("🤖 BOT GAME START:", {
+            roomId,
+            playerColor: playerIsWhite ? "w" : "b",
+            botColor: botState.botColor,
+            fen: game.fen(),
+            level: data.level
+        });
+
+        // ==========================================
+        // ENGINE STARTEN
+        // ==========================================
 
         getEngine(botState, roomId);
 
-        if (botIsWhite) {
+        // Wenn Bot Weiß ist UND Weiß am Zug ist,
+        // muss Stockfish sofort ziehen.
+        if (botIsWhite && game.turn() === "w") {
             setTimeout(() => startBotMove(roomId), 500);
         }
     });
