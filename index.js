@@ -107,27 +107,27 @@ function getMatchRange(player) {
     const waitedSeconds =
         (Date.now() - player.joinedAt) / 1000;
 
-    // 0–10 Sekunden
-    if (waitedSeconds < 10) {
+    // 0–5 Sekunden
+    if (waitedSeconds < 5) {
         return 100;
     }
 
-    // 10–20 Sekunden
-    if (waitedSeconds < 20) {
+    // 5–10 Sekunden
+    if (waitedSeconds < 10) {
         return 150;
     }
 
-    // 20–40 Sekunden
-    if (waitedSeconds < 40) {
+    // 15 Sekunden
+    if (waitedSeconds < 15) {
         return 250;
     }
 
-    // 40–60 Sekunden
-    if (waitedSeconds < 60) {
+    // 20 Sekunden
+    if (waitedSeconds < 20) {
         return 400;
     }
 
-    // Ab 60 Sekunden
+
     return 600;
 }
 
