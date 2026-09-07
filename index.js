@@ -126,7 +126,7 @@ function createPvPGame() {
         increment: 2000,
         activeColor: "w",
         lastTick: Date.now(),
-        paused: false, // true while a reconnect grace period is running
+        paused: false, // true während einer Reconnect-Grace-Period
         players: { w: null, b: null },
         authIds: { w: null, b: null },
         ratings: { w: 1000, b: 1000 },
@@ -527,12 +527,28 @@ io.on("connection", (socket) => {
             increment: g.increment,
             whiteRating: g.ratings.w,
             blackRating: g.ratings.b,
+            whiteAuthId: g.authIds.w, // NEU: für dauerhaftes "Freund hinzufügen"
+            blackAuthId: g.authIds.b, // NEU
             resumed: true,
         });
 
         io.to(roomId).emit("opponent_reconnected", { color });
 
         console.log("PLAYER RECONNECTED:", { authId, roomId, color });
+    });
+
+    // =============================
+    // FRIENDS: ONLINE STATUS
+    // =============================
+
+    socket.on("check_friends_online", (data) => {
+        const authIds = Array.isArray(data?.authIds)
+            ? data.authIds.filter((id) => isNonEmptyString(id, 128))
+            : [];
+
+        const online = authIds.filter((id) => authenticatedUsers.has(id));
+
+        socket.emit("friends_online_status", { online });
     });
 
     // =============================
@@ -615,6 +631,8 @@ io.on("connection", (socket) => {
             blackAvatar: player.avatar,
             whiteRating: opponent.rating,
             blackRating: player.rating,
+            whiteAuthId: opponent.authId, // NEU: für dauerhaftes "Freund hinzufügen"
+            blackAuthId: player.authId, // NEU
             whiteTime: game.whiteTime,
             blackTime: game.blackTime,
             increment: game.increment,
