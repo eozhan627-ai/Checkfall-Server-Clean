@@ -5,14 +5,36 @@ import { Chess } from "chess.js";
 import { spawn } from "child_process";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
+import crypto from "crypto";
 
 const app = express();
-app.use(express.json());
+
+// =============================
+// SECURITY / CONFIG
+// =============================
+
+// Setze ALLOWED_ORIGINS in der .env, z.B. "https://meineapp.com,https://admin.meineapp.com"
+// Fällt im Dev-Fall auf "*" zurück, damit lokale Tests weiter funktionieren.
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+    : "*";
+
+const RECONNECT_GRACE_MS = 25_000; // Zeit, die ein Spieler nach Disconnect hat, um zurückzukommen
+const MAX_CHAT_MESSAGES_PER_10S = 8;
+const MAX_MOVES_PER_2S = 12;
+
+app.use(express.json({ limit: "1mb" }));
 
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
         fileSize: 5 * 1024 * 1024,
+    },
+    fileFilter: (req, file, cb) => {
+        if (!file.mimetype?.startsWith("image/")) {
+            return cb(new Error("Only image uploads are allowed"));
+        }
+        cb(null, true);
     },
 });
 
@@ -26,7 +48,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: "*",
+        origin: ALLOWED_ORIGINS,
     },
 });
 
@@ -34,67 +56,109 @@ const io = new Server(server, {
 // STATE
 // =============================
 
-const games = new Map();
-const botGames = new Map();
+const games = new Map(); // roomId -> pvp game state
+const botGames = new Map(); // roomId -> bot game state
 
-const socketToRoom = new Map();
-
-// authId -> socket.id
-const authenticatedUsers = new Map();
-
-// =============================
-// MATCHMAKING QUEUE
-// =============================
+const socketToRoom = new Map(); // socket.id -> roomId
+const authenticatedUsers = new Map(); // authId -> socket.id
+const authIdToRoom = new Map(); // authId -> roomId (survives disconnect, used for reconnect)
+const disconnectTimers = new Map(); // roomId -> { timeout, color, authId }
 
 const matchmakingQueue = [];
 
+// Simple per-socket rate limiting buckets
+const rateBuckets = new Map(); // socket.id -> { chat: number[], moves: number[] }
+
+function getBucket(socketId) {
+    if (!rateBuckets.has(socketId)) {
+        rateBuckets.set(socketId, { chat: [], moves: [] });
+    }
+    return rateBuckets.get(socketId);
+}
+
+function allowAction(socketId, kind, maxCount, windowMs) {
+    const bucket = getBucket(socketId);
+    const now = Date.now();
+    bucket[kind] = bucket[kind].filter((t) => now - t < windowMs);
+
+    if (bucket[kind].length >= maxCount) {
+        return false;
+    }
+
+    bucket[kind].push(now);
+    return true;
+}
+
 // =============================
-// GAME FACTORY
+// SMALL VALIDATION HELPERS
+// =============================
+
+function isNonEmptyString(value, maxLen = 200) {
+    return typeof value === "string" && value.length > 0 && value.length <= maxLen;
+}
+
+function isValidSquare(value) {
+    return typeof value === "string" && /^[a-h][1-8]$/.test(value);
+}
+
+function isValidMovePayload(move) {
+    if (!move || typeof move !== "object") return false;
+    if (!isValidSquare(move.from) || !isValidSquare(move.to)) return false;
+    if (
+        move.promotion !== undefined &&
+        move.promotion !== null &&
+        !["q", "r", "b", "n"].includes(move.promotion)
+    ) {
+        return false;
+    }
+    return true;
+}
+
+// =============================
+// GAME FACTORIES
 // =============================
 
 function createPvPGame() {
     return {
         game: new Chess(),
-
         whiteTime: 300000,
         blackTime: 300000,
-
         increment: 2000,
-
         activeColor: "w",
-
         lastTick: Date.now(),
-
-        players: {
-            w: null,
-            b: null,
-        },
-
-        ratings: {
-            w: 100,
-            b: 100,
-        },
+        paused: false, // true while a reconnect grace period is running
+        players: { w: null, b: null },
+        authIds: { w: null, b: null },
+        ratings: { w: 1000, b: 1000 },
     };
 }
 
-// =============================
-// BOT GAME FACTORY
-// =============================
+// Level ist eine grobe Spielstärke 0-20 (UCI Skill Level).
+// Falls dein Client größere Werte schickt (z.B. eine Elo-artige Zahl),
+// wird hier heruntergerechnet - Mapping ggf. an deine Client-Skala anpassen.
+function normalizeSkillLevel(rawLevel) {
+    const n = Number(rawLevel);
+    if (!Number.isFinite(n)) return 10;
+
+    if (n <= 20) {
+        return Math.min(20, Math.max(0, Math.round(n)));
+    }
+
+    // z.B. 300 -> ca. Skill 6
+    return Math.min(20, Math.max(0, Math.round(n / 50)));
+}
 
 function createBotGame(level = 300) {
+    const skill = normalizeSkillLevel(level);
+
     return {
         game: new Chess(),
-
-        level,
-
+        skill,
+        depth: Math.max(2, Math.round(2 + skill * 0.65)), // grob 2-15
         botColor: "b",
-
         thinking: false,
-
         pending: false,
-
         engine: null,
-
         engineReady: false,
     };
 }
@@ -104,61 +168,25 @@ function createBotGame(level = 300) {
 // =============================
 
 function getMatchRange(player) {
-    const waitedSeconds =
-        (Date.now() - player.joinedAt) / 1000;
+    const waitedSeconds = (Date.now() - player.joinedAt) / 1000;
 
-    // 0–5 Sekunden
-    if (waitedSeconds < 5) {
-        return 100;
-    }
-
-    // 5–10 Sekunden
-    if (waitedSeconds < 10) {
-        return 150;
-    }
-
-    // 15 Sekunden
-    if (waitedSeconds < 15) {
-        return 250;
-    }
-
-    // 20 Sekunden
-    if (waitedSeconds < 20) {
-        return 400;
-    }
-
+    if (waitedSeconds < 5) return 100;
+    if (waitedSeconds < 10) return 150;
+    if (waitedSeconds < 15) return 250;
+    if (waitedSeconds < 20) return 400;
 
     return 600;
 }
 
-// =============================
-// FIND MATCH
-// =============================
-
 function findMatchForPlayer(player) {
-    const playerRange =
-        getMatchRange(player);
+    const playerRange = getMatchRange(player);
 
-    for (
-        let i = 0;
-        i < matchmakingQueue.length;
-        i++
-    ) {
-        const opponent =
-            matchmakingQueue[i];
+    for (let i = 0; i < matchmakingQueue.length; i++) {
+        const opponent = matchmakingQueue[i];
 
-        // Nicht gegen sich selbst
-        if (
-            opponent.id === player.id
-        ) {
-            continue;
-        }
+        if (opponent.id === player.id) continue;
 
-        // Prüfen, ob der Socket überhaupt noch existiert
-        const opponentSocket =
-            io.sockets.sockets.get(
-                opponent.id
-            );
+        const opponentSocket = io.sockets.sockets.get(opponent.id);
 
         if (!opponentSocket) {
             matchmakingQueue.splice(i, 1);
@@ -166,31 +194,12 @@ function findMatchForPlayer(player) {
             continue;
         }
 
-        const eloDifference =
-            Math.abs(
-                player.rating -
-                opponent.rating
-            );
+        const eloDifference = Math.abs(player.rating - opponent.rating);
+        const opponentRange = getMatchRange(opponent);
+        const allowedRange = Math.min(playerRange, opponentRange);
 
-        const opponentRange =
-            getMatchRange(opponent);
-
-        // Beide Spieler müssen den anderen akzeptieren
-        const allowedRange =
-            Math.min(
-                playerRange,
-                opponentRange
-            );
-
-        if (
-            eloDifference <=
-            allowedRange
-        ) {
-            matchmakingQueue.splice(
-                i,
-                1
-            );
-
+        if (eloDifference <= allowedRange) {
+            matchmakingQueue.splice(i, 1);
             return opponent;
         }
     }
@@ -198,17 +207,28 @@ function findMatchForPlayer(player) {
     return null;
 }
 
+function removeFromQueue(socketId) {
+    const idx = matchmakingQueue.findIndex((p) => p.id === socketId);
+    if (idx !== -1) {
+        matchmakingQueue.splice(idx, 1);
+    }
+}
+
 // =============================
-// TIMER
+// TIMER (PvP)
 // =============================
 
 setInterval(() => {
     const now = Date.now();
 
     for (const [roomId, g] of games.entries()) {
-        const diff =
-            now - g.lastTick;
+        if (g.paused) {
+            // Uhr läuft während einer Reconnect-Grace-Period nicht weiter.
+            g.lastTick = now;
+            continue;
+        }
 
+        const diff = Math.max(0, now - g.lastTick);
         g.lastTick = now;
 
         if (g.activeColor === "w") {
@@ -217,1315 +237,755 @@ setInterval(() => {
             g.blackTime -= diff;
         }
 
-        if (
-            g.whiteTime <= 0 ||
-            g.blackTime <= 0
-        ) {
-            const winnerSocket =
-                g.whiteTime <= 0
-                    ? g.players.b
-                    : g.players.w;
+        if (g.whiteTime <= 0 || g.blackTime <= 0) {
+            const winnerSocket = g.whiteTime <= 0 ? g.players.b : g.players.w;
 
-            io.to(roomId).emit(
-                "game_over",
-                {
-                    type: "timeout",
-                    winner:
-                        winnerSocket,
-                }
-            );
+            io.to(roomId).emit("game_over", {
+                type: "timeout",
+                winner: winnerSocket,
+            });
 
-            games.delete(roomId);
-
+            cleanupRoom(roomId);
             continue;
         }
 
-        io.to(roomId).emit(
-            "timer_update",
-            {
-                whiteTime:
-                    g.whiteTime,
-
-                blackTime:
-                    g.blackTime,
-
-                activeColor:
-                    g.activeColor,
-            }
-        );
+        io.to(roomId).emit("timer_update", {
+            whiteTime: g.whiteTime,
+            blackTime: g.blackTime,
+            activeColor: g.activeColor,
+        });
     }
 }, 1000);
+
+// =============================
+// ROOM CLEANUP
+// =============================
+
+function cleanupRoom(roomId) {
+    games.delete(roomId);
+
+    const bot = botGames.get(roomId);
+    if (bot?.engine) {
+        try {
+            bot.engine.stdin.write("quit\n");
+            bot.engine.kill();
+        } catch (error) {
+            console.log("ENGINE KILL ERROR:", error);
+        }
+    }
+    botGames.delete(roomId);
+
+    const timer = disconnectTimers.get(roomId);
+    if (timer) {
+        clearTimeout(timer.timeout);
+        disconnectTimers.delete(roomId);
+    }
+
+    for (const [socketId, r] of socketToRoom.entries()) {
+        if (r === roomId) socketToRoom.delete(socketId);
+    }
+
+    for (const [authId, r] of authIdToRoom.entries()) {
+        if (r === roomId) authIdToRoom.delete(authId);
+    }
+}
 
 // =============================
 // STOCKFISH
 // =============================
 
-function getEngine(
-    botState,
-    roomId
-) {
+function getEngine(botState, roomId) {
     if (botState.engine) {
         return botState.engine;
     }
 
-    const engine = spawn(
-        "/usr/games/stockfish"
-    );
-
+    const engine = spawn("/usr/games/stockfish");
     let buffer = "";
 
     botState.engineReady = false;
 
-    engine.stdout.on(
-        "data",
-        (data) => {
-            buffer += data.toString();
+    engine.on("error", (err) => {
+        console.error("ENGINE SPAWN ERROR:", err);
+    });
 
-            const lines =
-                buffer.split("\n");
+    engine.stdout.on("data", (data) => {
+        buffer += data.toString();
 
-            buffer =
-                lines.pop();
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
 
-            for (let line of lines) {
-                line =
-                    line.trim();
+        for (let line of lines) {
+            line = line.trim();
 
-                if (
-                    line === "uciok"
-                ) {
-                    engine.stdin.write(
-                        "isready\n"
-                    );
-                }
+            if (line === "uciok") {
+                engine.stdin.write(
+                    `setoption name Skill Level value ${botState.skill}\n`
+                );
+                engine.stdin.write("isready\n");
+            }
 
-                if (
-                    line === "readyok"
-                ) {
-                    botState.engineReady =
-                        true;
+            if (line === "readyok") {
+                botState.engineReady = true;
 
-                    if (
-                        botState.game.turn() ===
-                        botState.botColor
-                    ) {
-                        startBotMove(
-                            roomId
-                        );
-                    }
-                }
-
-                if (
-                    line.startsWith(
-                        "bestmove"
-                    )
-                ) {
-                    const uci =
-                        line.split(" ")[1];
-
-                    if (
-                        !uci ||
-                        uci === "(none)"
-                    ) {
-                        return;
-                    }
-
-                    const from =
-                        uci.slice(0, 2);
-
-                    const to =
-                        uci.slice(2, 4);
-
-                    const promotion =
-                        uci[4];
-
-                    const result =
-                        botState.game.move(
-                            {
-                                from,
-                                to,
-                                promotion,
-                            }
-                        );
-
-                    if (!result) {
-                        return;
-                    }
-
-                    io.to(roomId).emit(
-                        "opponent_move",
-                        {
-                            from:
-                                result.from,
-
-                            to:
-                                result.to,
-
-                            promotion:
-                                result.promotion,
-                        }
-                    );
-
-                    botState.thinking =
-                        false;
-
-                    botState.pending =
-                        false;
+                if (botState.game.turn() === botState.botColor) {
+                    startBotMove(roomId);
                 }
             }
+
+            if (line.startsWith("bestmove")) {
+                const uci = line.split(" ")[1];
+
+                botState.thinking = false;
+                botState.pending = false;
+
+                if (!uci || uci === "(none)") {
+                    return;
+                }
+
+                const from = uci.slice(0, 2);
+                const to = uci.slice(2, 4);
+                const promotion = uci[4];
+
+                let result;
+                try {
+                    result = botState.game.move({ from, to, promotion });
+                } catch (error) {
+                    console.log("BOT MOVE REJECTED:", uci, error?.message);
+                    return;
+                }
+
+                if (!result) return;
+
+                io.to(roomId).emit("opponent_move", {
+                    from: result.from,
+                    to: result.to,
+                    promotion: result.promotion,
+                });
+
+                emitGameOverIfBotGameEnded(roomId, botState);
+            }
         }
-    );
+    });
 
-    engine.stdin.write(
-        "uci\n"
-    );
-
-    botState.engine =
-        engine;
+    engine.stdin.write("uci\n");
+    botState.engine = engine;
 
     return engine;
 }
 
 function startBotMove(roomId) {
-    const botState =
-        botGames.get(roomId);
+    const botState = botGames.get(roomId);
+    if (!botState) return;
+    if (botState.thinking || botState.pending) return;
+    if (botState.game.isGameOver()) return;
 
-    if (!botState) {
-        return;
-    }
+    const engine = getEngine(botState, roomId);
+    if (!botState.engineReady) return;
 
-    if (botState.thinking) {
-        return;
-    }
-
-    if (botState.pending) {
-        return;
-    }
-
-    const engine =
-        getEngine(
-            botState,
-            roomId
-        );
-
-    if (
-        !botState.engineReady
-    ) {
-        return;
-    }
-
-    botState.pending =
-        true;
-
-    botState.thinking =
-        true;
+    botState.pending = true;
+    botState.thinking = true;
 
     setTimeout(() => {
-        engine.stdin.write(
-            `position fen ${botState.game.fen()}\n`
-        );
+        if (!botGames.has(roomId)) return; // Raum wurde inzwischen aufgeräumt
 
-        engine.stdin.write(
-            "go depth 5\n"
-        );
+        engine.stdin.write(`position fen ${botState.game.fen()}\n`);
+        engine.stdin.write(`go depth ${botState.depth}\n`);
     }, 300);
+}
+
+function emitGameOverIfBotGameEnded(roomId, botState) {
+    if (!botState.game.isGameOver()) return;
+
+    const humanColor = botState.botColor === "w" ? "b" : "w";
+    let payload;
+
+    if (botState.game.isCheckmate()) {
+        const winnerIsBot = botState.game.turn() === humanColor; // der Spieler, der dran ist, wurde matt gesetzt
+        payload = { type: "checkmate", winner: winnerIsBot ? "bot" : "human" };
+    } else {
+        payload = { type: "draw" };
+    }
+
+    io.to(roomId).emit("game_over", payload);
 }
 
 // =============================
 // AVATAR UPLOAD
 // =============================
 
-app.post(
-    "/upload-avatar",
-    upload.single("avatar"),
-    async (req, res) => {
-        try {
-            if (!req.file) {
-                return res.status(400).json({
-                    error:
-                        "No avatar uploaded",
-                });
-            }
-
-            if (!req.body.userId) {
-                return res.status(400).json({
-                    error:
-                        "Missing userId",
-                });
-            }
-
-            const result =
-                await new Promise(
-                    (
-                        resolve,
-                        reject
-                    ) => {
-                        const stream =
-                            cloudinary.uploader.upload_stream(
-                                {
-                                    folder:
-                                        "checkfall/avatars",
-
-                                    public_id:
-                                        req.body.userId,
-
-                                    overwrite:
-                                        true,
-
-                                    resource_type:
-                                        "image",
-                                },
-                                (
-                                    error,
-                                    result
-                                ) => {
-                                    if (
-                                        error
-                                    ) {
-                                        reject(
-                                            error
-                                        );
-                                    } else {
-                                        resolve(
-                                            result
-                                        );
-                                    }
-                                }
-                            );
-
-                        stream.end(
-                            req.file.buffer
-                        );
-                    }
-                );
-
-            console.log(
-                "AVATAR UPLOADED:",
-                result.secure_url
-            );
-
-            res.json({
-                success: true,
-                url:
-                    result.secure_url,
-            });
-        } catch (error) {
-            console.error(
-                "AVATAR UPLOAD ERROR:",
-                error
-            );
-
-            res.status(500).json({
-                error:
-                    "Avatar upload failed",
-            });
+app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: "No avatar uploaded" });
         }
+
+        if (!isNonEmptyString(req.body.userId, 128)) {
+            return res.status(400).json({ error: "Missing or invalid userId" });
+        }
+
+        const result = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+                {
+                    folder: "checkfall/avatars",
+                    public_id: req.body.userId,
+                    overwrite: true,
+                    resource_type: "image",
+                },
+                (error, result) => {
+                    if (error) reject(error);
+                    else resolve(result);
+                }
+            );
+
+            stream.end(req.file.buffer);
+        });
+
+        console.log("AVATAR UPLOADED:", result.secure_url);
+
+        res.json({ success: true, url: result.secure_url });
+    } catch (error) {
+        console.error("AVATAR UPLOAD ERROR:", error);
+        res.status(500).json({ error: "Avatar upload failed" });
     }
-);
+});
 
 // =============================
 // SOCKET
 // =============================
 
-io.on(
-    "connection",
-    (socket) => {
-        console.log(
-            "Connected:",
-            socket.id
-        );
+io.on("connection", (socket) => {
+    console.log("Connected:", socket.id);
 
-        // =============================
-        // AUTHENTICATED USER
-        // =============================
+    // =============================
+    // AUTHENTICATED USER + RECONNECT
+    // =============================
 
-        socket.on(
-            "authenticate_socket",
-            (data) => {
-                const authId =
-                    data?.authId;
+    socket.on("authenticate_socket", (data) => {
+        const authId = data?.authId;
 
-                if (!authId) {
-                    console.log(
-                        "SOCKET AUTH: missing authId",
-                        socket.id
-                    );
+        if (!isNonEmptyString(authId, 128)) {
+            console.log("SOCKET AUTH: missing/invalid authId", socket.id);
+            return;
+        }
 
-                    return;
-                }
+        const oldSocketId = authenticatedUsers.get(authId);
 
-                console.log(
-                    "SOCKET AUTH:",
+        if (oldSocketId && oldSocketId !== socket.id) {
+            const oldSocket = io.sockets.sockets.get(oldSocketId);
+
+            if (oldSocket) {
+                console.log("KICKING OLD DEVICE:", {
                     authId,
-                    socket.id
-                );
+                    oldSocket: oldSocketId,
+                    newSocket: socket.id,
+                });
 
-                const oldSocketId =
-                    authenticatedUsers.get(
-                        authId
-                    );
+                oldSocket.emit("session_kicked", {
+                    message: "You are now signed in on another device.",
+                });
 
-                // =============================
-                // SAME ACCOUNT ALREADY ONLINE
-                // =============================
-
-                if (
-                    oldSocketId &&
-                    oldSocketId !==
-                    socket.id
-                ) {
-                    const oldSocket =
-                        io.sockets.sockets.get(
-                            oldSocketId
-                        );
-
-                    if (oldSocket) {
-                        console.log(
-                            "KICKING OLD DEVICE:",
-                            {
-                                authId,
-
-                                oldSocket:
-                                    oldSocketId,
-
-                                newSocket:
-                                    socket.id,
-                            }
-                        );
-
-                        oldSocket.emit(
-                            "session_kicked",
-                            {
-                                message:
-                                    "You are now signed in on another device.",
-                            }
-                        );
-
-                        oldSocket.disconnect(
-                            true
-                        );
-                    }
-                }
-
-                authenticatedUsers.set(
-                    authId,
-                    socket.id
-                );
-
-                socket.data.authId =
-                    authId;
-
-                console.log(
-                    "ACTIVE DEVICE:",
-                    {
-                        authId,
-
-                        socket:
-                            socket.id,
-                    }
-                );
-
-                socket.emit(
-                    "socket_authenticated"
-                );
+                oldSocket.disconnect(true);
             }
-        );
+        }
 
-        // =============================
-        // PvP MATCHMAKING
-        // =============================
+        authenticatedUsers.set(authId, socket.id);
+        socket.data.authId = authId;
 
-        socket.on(
-            "find_match",
-            (data) => {
-                // Bereits in Queue?
-                if (
-                    matchmakingQueue.some(
-                        (player) =>
-                            player.id ===
-                            socket.id
-                    )
-                ) {
-                    console.log(
-                        "Already waiting:",
-                        socket.id
-                    );
+        socket.emit("socket_authenticated");
 
-                    return;
-                }
+        // ==== RECONNECT: gibt es ein laufendes Spiel für diesen authId? ====
+        const roomId = authIdToRoom.get(authId);
+        const g = roomId ? games.get(roomId) : null;
 
-                const rating =
-                    Number(
-                        data?.rating
-                    );
+        if (!g) return;
 
-                // Elo validieren
-                if (
-                    !Number.isFinite(
-                        rating
-                    ) ||
-                    rating < 100
-                ) {
-                    console.log(
-                        "Invalid matchmaking rating:",
-                        data?.rating
-                    );
+        const color = g.authIds.w === authId ? "w" : g.authIds.b === authId ? "b" : null;
+        if (!color) return;
 
-                    socket.emit(
-                        "matchmaking_error",
-                        {
-                            message:
-                                "Invalid rating",
-                        }
-                    );
+        // Alten (toten) Socket-Eintrag durch den neuen ersetzen
+        g.players[color] = socket.id;
+        socketToRoom.set(socket.id, roomId);
+        socket.join(roomId);
 
-                    return;
-                }
+        const timer = disconnectTimers.get(roomId);
+        if (timer) {
+            clearTimeout(timer.timeout);
+            disconnectTimers.delete(roomId);
+        }
 
-                const player = {
-                    id:
-                        socket.id,
+        g.paused = false;
+        g.lastTick = Date.now();
 
-                    authId:
-                        socket.data
-                            .authId ||
-                        null,
+        socket.emit("game_start", {
+            roomId,
+            white: g.players.w,
+            black: g.players.b,
+            fen: g.game.fen(),
+            whiteTime: g.whiteTime,
+            blackTime: g.blackTime,
+            activeColor: g.activeColor,
+            increment: g.increment,
+            whiteRating: g.ratings.w,
+            blackRating: g.ratings.b,
+            resumed: true,
+        });
 
-                    name:
-                        data?.name ||
-                        "Player",
+        io.to(roomId).emit("opponent_reconnected", { color });
 
-                    avatar:
-                        data?.avatar ||
-                        "",
+        console.log("PLAYER RECONNECTED:", { authId, roomId, color });
+    });
 
-                    rating,
+    // =============================
+    // PvP MATCHMAKING
+    // =============================
 
-                    joinedAt:
-                        Date.now(),
-                };
+    socket.on("find_match", (data) => {
+        if (matchmakingQueue.some((p) => p.id === socket.id)) {
+            console.log("Already waiting:", socket.id);
+            return;
+        }
 
-                const opponent =
-                    findMatchForPlayer(
-                        player
-                    );
+        const rating = Number(data?.rating);
 
-                // =============================
-                // NO MATCH
-                // =============================
+        if (!Number.isFinite(rating) || rating < 0) {
+            socket.emit("matchmaking_error", { message: "Invalid rating" });
+            return;
+        }
 
-                if (!opponent) {
-                    matchmakingQueue.push(
-                        player
-                    );
+        if (!isNonEmptyString(data?.name, 60)) {
+            socket.emit("matchmaking_error", { message: "Invalid name" });
+            return;
+        }
 
-                    socket.emit(
-                        "waiting"
-                    );
+        const player = {
+            id: socket.id,
+            authId: socket.data.authId || null,
+            name: data.name,
+            avatar: isNonEmptyString(data?.avatar, 500) ? data.avatar : "",
+            rating,
+            joinedAt: Date.now(),
+        };
 
-                    console.log(
-                        "PLAYER WAITING:",
-                        {
-                            id:
-                                player.id,
+        const opponent = findMatchForPlayer(player);
 
-                            name:
-                                player.name,
+        if (!opponent) {
+            matchmakingQueue.push(player);
+            socket.emit("waiting");
 
-                            rating:
-                                player.rating,
+            console.log("PLAYER WAITING:", {
+                id: player.id,
+                name: player.name,
+                rating: player.rating,
+                queueSize: matchmakingQueue.length,
+            });
 
-                            queueSize:
-                                matchmakingQueue.length,
-                        }
-                    );
+            return;
+        }
 
-                    return;
-                }
+        const roomId = `${crypto.randomUUID()}`;
 
-                // =============================
-                // MATCH FOUND
-                // =============================
+        socket.join(roomId);
+        io.sockets.sockets.get(opponent.id)?.join(roomId);
 
-                const roomId =
-                    `${opponent.id}_${player.id}`;
+        const game = createPvPGame();
 
-                socket.join(
-                    roomId
-                );
+        // Wer länger gewartet hat, bekommt Weiß.
+        game.players.w = opponent.id;
+        game.players.b = player.id;
+        game.authIds.w = opponent.authId;
+        game.authIds.b = player.authId;
+        game.ratings.w = opponent.rating;
+        game.ratings.b = player.rating;
 
-                io.sockets.sockets
-                    .get(
-                        opponent.id
-                    )
-                    ?.join(roomId);
+        games.set(roomId, game);
 
-                const game =
-                    createPvPGame();
+        socketToRoom.set(opponent.id, roomId);
+        socketToRoom.set(player.id, roomId);
 
-                // Der Spieler, der länger gewartet hat,
-                // bekommt Weiß.
-                game.players.w =
-                    opponent.id;
+        if (opponent.authId) authIdToRoom.set(opponent.authId, roomId);
+        if (player.authId) authIdToRoom.set(player.authId, roomId);
 
-                game.players.b =
-                    player.id;
+        io.to(roomId).emit("game_start", {
+            roomId,
+            white: opponent.id,
+            black: player.id,
+            whiteName: opponent.name,
+            blackName: player.name,
+            whiteAvatar: opponent.avatar,
+            blackAvatar: player.avatar,
+            whiteRating: opponent.rating,
+            blackRating: player.rating,
+            whiteTime: game.whiteTime,
+            blackTime: game.blackTime,
+            increment: game.increment,
+        });
 
-                game.ratings.w =
-                    opponent.rating;
+        console.log("MATCH FOUND:", {
+            roomId,
+            white: opponent.name,
+            whiteRating: opponent.rating,
+            black: player.name,
+            blackRating: player.rating,
+            difference: Math.abs(opponent.rating - player.rating),
+        });
+    });
 
-                game.ratings.b =
-                    player.rating;
+    socket.on("cancel_matchmaking", () => {
+        removeFromQueue(socket.id);
+        socket.emit("matchmaking_cancelled");
+    });
 
-                games.set(
-                    roomId,
-                    game
-                );
+    // =============================
+    // BOT MATCH
+    // =============================
 
-                socketToRoom.set(
-                    opponent.id,
-                    roomId
-                );
+    socket.on("find_bot_match", (data) => {
+        const roomId = `bot_${socket.id}`;
 
-                socketToRoom.set(
-                    player.id,
-                    roomId
-                );
+        socket.join(roomId);
 
-                io.to(roomId).emit(
-                    "game_start",
-                    {
-                        roomId,
+        let botIsWhite;
 
-                        white:
-                            opponent.id,
+        if (data?.playerColor === "w") {
+            botIsWhite = false;
+        } else if (data?.playerColor === "b") {
+            botIsWhite = true;
+        } else {
+            botIsWhite = Math.random() < 0.5;
+        }
 
-                        black:
-                            player.id,
+        const playerIsWhite = !botIsWhite;
 
-                        whiteName:
-                            opponent.name,
+        let game;
+        try {
+            game =
+                data?.startFEN && data.startFEN !== "startpos"
+                    ? new Chess(data.startFEN)
+                    : new Chess();
+        } catch (error) {
+            console.error("Invalid startFEN:", data?.startFEN);
+            game = new Chess();
+        }
 
-                        blackName:
-                            player.name,
+        const botState = createBotGame(data?.level);
+        botState.game = game;
+        botState.botColor = botIsWhite ? "w" : "b";
 
-                        whiteAvatar:
-                            opponent.avatar,
+        botGames.set(roomId, botState);
+        socketToRoom.set(socket.id, roomId);
 
-                        blackAvatar:
-                            player.avatar,
+        io.to(roomId).emit("game_start", {
+            roomId,
+            white: botIsWhite ? "bot" : socket.id,
+            black: botIsWhite ? socket.id : "bot",
+            whiteName: botIsWhite ? "Stockfish" : (isNonEmptyString(data?.name, 60) ? data.name : "Player"),
+            blackName: botIsWhite ? (isNonEmptyString(data?.name, 60) ? data.name : "Player") : "Stockfish",
+            playerColor: playerIsWhite ? "w" : "b",
+            botColor: botState.botColor,
+            fen: game.fen(),
+        });
 
-                        whiteRating:
-                            opponent.rating,
+        console.log("BOT GAME START:", {
+            roomId,
+            playerColor: playerIsWhite ? "w" : "b",
+            botColor: botState.botColor,
+            skill: botState.skill,
+            depth: botState.depth,
+        });
 
-                        blackRating:
-                            player.rating,
+        getEngine(botState, roomId);
 
-                        whiteTime:
-                            game.whiteTime,
+        if (botIsWhite && game.turn() === "w") {
+            setTimeout(() => startBotMove(roomId), 500);
+        }
+    });
 
-                        blackTime:
-                            game.blackTime,
+    // =============================
+    // PLAYER MOVE
+    // =============================
 
-                        increment:
-                            game.increment,
-                    }
-                );
+    socket.on("player_move", ({ roomId, move }) => {
+        if (!isNonEmptyString(roomId, 200) || !isValidMovePayload(move)) {
+            return;
+        }
 
-                console.log(
-                    "MATCH FOUND:",
-                    {
-                        roomId,
+        if (!allowAction(socket.id, "moves", MAX_MOVES_PER_2S, 2000)) {
+            return;
+        }
 
-                        white:
-                            opponent.name,
+        // =========================
+        // BOT
+        // =========================
 
-                        whiteRating:
-                            opponent.rating,
+        const bot = botGames.get(roomId);
 
-                        black:
-                            player.name,
+        if (bot) {
+            const humanColor = bot.botColor === "w" ? "b" : "w";
 
-                        blackRating:
-                            player.rating,
-
-                        difference:
-                            Math.abs(
-                                opponent.rating -
-                                player.rating
-                            ),
-                    }
-                );
+            if (bot.game.turn() !== humanColor) {
+                return; // nicht der Zug des Spielers
             }
-        );
 
-        // =============================
-        // BOT MATCH
-        // =============================
-
-        socket.on(
-            "find_bot_match",
-            (data) => {
-                const roomId =
-                    `bot_${socket.id}`;
-
-                socket.join(
-                    roomId
-                );
-
-                let botIsWhite;
-
-                if (
-                    data.playerColor ===
-                    "w"
-                ) {
-                    botIsWhite =
-                        false;
-                } else if (
-                    data.playerColor ===
-                    "b"
-                ) {
-                    botIsWhite =
-                        true;
-                } else {
-                    botIsWhite =
-                        Math.random() <
-                        0.5;
-                }
-
-                const playerIsWhite =
-                    !botIsWhite;
-
-                let game;
-
-                try {
-                    if (
-                        data.startFEN &&
-                        data.startFEN !==
-                        "startpos"
-                    ) {
-                        game =
-                            new Chess(
-                                data.startFEN
-                            );
-                    } else {
-                        game =
-                            new Chess();
-                    }
-                } catch (error) {
-                    console.error(
-                        "Invalid startFEN:",
-                        data.startFEN
-                    );
-
-                    game =
-                        new Chess();
-                }
-
-                const botState =
-                    createBotGame(
-                        data.level
-                    );
-
-                botState.game =
-                    game;
-
-                botState.botColor =
-                    botIsWhite
-                        ? "w"
-                        : "b";
-
-                botGames.set(
-                    roomId,
-                    botState
-                );
-
-                socketToRoom.set(
-                    socket.id,
-                    roomId
-                );
-
-                io.to(roomId).emit(
-                    "game_start",
-                    {
-                        roomId,
-
-                        white:
-                            botIsWhite
-                                ? "bot"
-                                : socket.id,
-
-                        black:
-                            botIsWhite
-                                ? socket.id
-                                : "bot",
-
-                        whiteName:
-                            botIsWhite
-                                ? "Stockfish"
-                                : data.name,
-
-                        blackName:
-                            botIsWhite
-                                ? data.name
-                                : "Stockfish",
-
-                        playerColor:
-                            playerIsWhite
-                                ? "w"
-                                : "b",
-
-                        botColor:
-                            botState.botColor,
-
-                        fen:
-                            game.fen(),
-                    }
-                );
-
-                console.log(
-                    "BOT GAME START:",
-                    {
-                        roomId,
-
-                        playerColor:
-                            playerIsWhite
-                                ? "w"
-                                : "b",
-
-                        botColor:
-                            botState.botColor,
-
-                        fen:
-                            game.fen(),
-
-                        level:
-                            data.level,
-                    }
-                );
-
-                getEngine(
-                    botState,
-                    roomId
-                );
-
-                if (
-                    botIsWhite &&
-                    game.turn() ===
-                    "w"
-                ) {
-                    setTimeout(
-                        () =>
-                            startBotMove(
-                                roomId
-                            ),
-                        500
-                    );
-                }
+            let result;
+            try {
+                result = bot.game.move(move);
+            } catch (error) {
+                return;
             }
-        );
 
-        // =============================
-        // PLAYER MOVE
-        // =============================
+            if (!result) return;
 
-        socket.on(
-            "player_move",
-            ({ roomId, move }) => {
-                // =========================
-                // BOT
-                // =========================
+            socket.to(roomId).emit("opponent_move", {
+                from: result.from,
+                to: result.to,
+                promotion: result.promotion,
+            });
 
-                const bot =
-                    botGames.get(
-                        roomId
-                    );
+            emitGameOverIfBotGameEnded(roomId, bot);
 
-                if (bot) {
-                    const result =
-                        bot.game.move(
-                            move
-                        );
-
-                    if (!result) {
-                        return;
-                    }
-
-                    socket
-                        .to(roomId)
-                        .emit(
-                            "opponent_move",
-                            {
-                                from:
-                                    result.from,
-
-                                to:
-                                    result.to,
-
-                                promotion:
-                                    result.promotion,
-                            }
-                        );
-
-                    if (
-                        !bot.game.isGameOver()
-                    ) {
-                        startBotMove(
-                            roomId
-                        );
-                    }
-
-                    return;
-                }
-
-                // =========================
-                // PvP
-                // =========================
-
-                const g =
-                    games.get(
-                        roomId
-                    );
-
-                if (!g) {
-                    return;
-                }
-
-                const expectedPlayer =
-                    g.activeColor ===
-                        "w"
-                        ? g.players.w
-                        : g.players.b;
-
-                if (
-                    socket.id !==
-                    expectedPlayer
-                ) {
-                    console.log(
-                        "Move rejected:",
-                        {
-                            socket:
-                                socket.id,
-
-                            expectedPlayer,
-
-                            activeColor:
-                                g.activeColor,
-                        }
-                    );
-
-                    return;
-                }
-
-                const result =
-                    g.game.move(
-                        move
-                    );
-
-                if (!result) {
-                    return;
-                }
-
-                const now =
-                    Date.now();
-
-                const diff =
-                    now -
-                    g.lastTick;
-
-                if (
-                    g.activeColor ===
-                    "w"
-                ) {
-                    g.whiteTime -=
-                        diff;
-
-                    g.whiteTime +=
-                        g.increment;
-                } else {
-                    g.blackTime -=
-                        diff;
-
-                    g.blackTime +=
-                        g.increment;
-                }
-
-                g.lastTick =
-                    now;
-
-                g.activeColor =
-                    g.activeColor ===
-                        "w"
-                        ? "b"
-                        : "w";
-
-                socket
-                    .to(roomId)
-                    .emit(
-                        "opponent_move",
-                        {
-                            from:
-                                result.from,
-
-                            to:
-                                result.to,
-
-                            promotion:
-                                result.promotion,
-                        }
-                    );
-
-                io.to(roomId).emit(
-                    "timer_update",
-                    {
-                        whiteTime:
-                            g.whiteTime,
-
-                        blackTime:
-                            g.blackTime,
-
-                        activeColor:
-                            g.activeColor,
-                    }
-                );
-
-                // =========================
-                // GAME OVER
-                // =========================
-
-                if (
-                    g.game.isGameOver()
-                ) {
-                    if (
-                        g.game.isCheckmate()
-                    ) {
-                        const winner =
-                            g.game.turn() ===
-                                "w"
-                                ? g.players.b
-                                : g.players.w;
-
-                        io.to(roomId).emit(
-                            "game_over",
-                            {
-                                type:
-                                    "checkmate",
-
-                                winner,
-                            }
-                        );
-                    } else {
-                        io.to(roomId).emit(
-                            "game_over",
-                            {
-                                type:
-                                    "draw",
-                            }
-                        );
-                    }
-
-                    games.delete(
-                        roomId
-                    );
-                }
+            if (!bot.game.isGameOver()) {
+                startBotMove(roomId);
             }
-        );
 
-        // =============================
-        // DRAW OFFER
-        // =============================
+            return;
+        }
 
-        socket.on(
-            "offer_draw",
-            ({ roomId }) => {
-                const g =
-                    games.get(
-                        roomId
-                    );
+        // =========================
+        // PvP
+        // =========================
 
-                if (!g) {
-                    return;
-                }
+        const g = games.get(roomId);
+        if (!g) return;
 
-                if (
-                    socket.id !==
-                    g.players.w &&
-                    socket.id !==
-                    g.players.b
-                ) {
-                    return;
-                }
+        const expectedPlayer = g.activeColor === "w" ? g.players.w : g.players.b;
 
-                const opponent =
-                    socket.id ===
-                        g.players.w
-                        ? g.players.b
-                        : g.players.w;
+        if (socket.id !== expectedPlayer) {
+            console.log("Move rejected:", {
+                socket: socket.id,
+                expectedPlayer,
+                activeColor: g.activeColor,
+            });
+            return;
+        }
 
-                io.to(
-                    opponent
-                ).emit(
-                    "draw_offer"
-                );
+        let result;
+        try {
+            result = g.game.move(move);
+        } catch (error) {
+            return;
+        }
+
+        if (!result) return;
+
+        const now = Date.now();
+        const diff = Math.max(0, now - g.lastTick);
+
+        if (g.activeColor === "w") {
+            g.whiteTime -= diff;
+            g.whiteTime += g.increment;
+        } else {
+            g.blackTime -= diff;
+            g.blackTime += g.increment;
+        }
+
+        g.lastTick = now;
+        g.activeColor = g.activeColor === "w" ? "b" : "w";
+
+        socket.to(roomId).emit("opponent_move", {
+            from: result.from,
+            to: result.to,
+            promotion: result.promotion,
+        });
+
+        io.to(roomId).emit("timer_update", {
+            whiteTime: g.whiteTime,
+            blackTime: g.blackTime,
+            activeColor: g.activeColor,
+        });
+
+        if (g.game.isGameOver()) {
+            if (g.game.isCheckmate()) {
+                const winner = g.game.turn() === "w" ? g.players.b : g.players.w;
+
+                io.to(roomId).emit("game_over", {
+                    type: "checkmate",
+                    winner,
+                });
+            } else {
+                io.to(roomId).emit("game_over", { type: "draw" });
             }
-        );
 
-        // =============================
-        // DRAW ANSWER
-        // =============================
+            cleanupRoom(roomId);
+        }
+    });
 
-        socket.on(
-            "answer_draw",
-            ({
-                roomId,
-                accept,
-            }) => {
-                const g =
-                    games.get(
-                        roomId
-                    );
+    // =============================
+    // DRAW OFFER / ANSWER
+    // =============================
 
-                if (!g) {
-                    return;
-                }
+    socket.on("offer_draw", ({ roomId }) => {
+        if (!isNonEmptyString(roomId, 200)) return;
 
-                if (
-                    socket.id !==
-                    g.players.w &&
-                    socket.id !==
-                    g.players.b
-                ) {
-                    return;
-                }
+        const g = games.get(roomId);
+        if (!g) return;
+        if (socket.id !== g.players.w && socket.id !== g.players.b) return;
 
-                if (accept) {
-                    io.to(
-                        roomId
-                    ).emit(
-                        "game_over",
-                        {
-                            type:
-                                "draw",
-                        }
-                    );
+        const opponent = socket.id === g.players.w ? g.players.b : g.players.w;
+        io.to(opponent).emit("draw_offer");
+    });
 
-                    games.delete(
-                        roomId
-                    );
-                } else {
-                    const opponent =
-                        socket.id ===
-                            g.players.w
-                            ? g.players.b
-                            : g.players.w;
+    socket.on("answer_draw", ({ roomId, accept }) => {
+        if (!isNonEmptyString(roomId, 200)) return;
 
-                    io.to(
-                        opponent
-                    ).emit(
-                        "draw_declined"
-                    );
-                }
-            }
-        );
+        const g = games.get(roomId);
+        if (!g) return;
+        if (socket.id !== g.players.w && socket.id !== g.players.b) return;
 
-        // =============================
-        // RESIGN
-        // =============================
+        if (accept) {
+            io.to(roomId).emit("game_over", { type: "draw" });
+            cleanupRoom(roomId);
+        } else {
+            const opponent = socket.id === g.players.w ? g.players.b : g.players.w;
+            io.to(opponent).emit("draw_declined");
+        }
+    });
 
-        socket.on(
-            "resign_game",
-            ({ roomId }) => {
-                const g =
-                    games.get(
-                        roomId
-                    );
+    // =============================
+    // RESIGN
+    // =============================
 
-                if (!g) {
-                    return;
-                }
+    socket.on("resign_game", ({ roomId }) => {
+        if (!isNonEmptyString(roomId, 200)) return;
 
-                if (
-                    socket.id !==
-                    g.players.w &&
-                    socket.id !==
-                    g.players.b
-                ) {
-                    return;
-                }
+        const g = games.get(roomId);
+        if (!g) return;
+        if (socket.id !== g.players.w && socket.id !== g.players.b) return;
 
-                const winner =
-                    socket.id ===
-                        g.players.w
-                        ? g.players.b
-                        : g.players.w;
+        const winner = socket.id === g.players.w ? g.players.b : g.players.w;
 
-                io.to(roomId).emit(
-                    "game_over",
-                    {
-                        type:
-                            "resign",
+        io.to(roomId).emit("game_over", { type: "resign", winner });
+        cleanupRoom(roomId);
+    });
 
+    // =============================
+    // CHAT
+    // =============================
+
+    socket.on("send_chat_message", ({ roomId, message }) => {
+        if (!isNonEmptyString(roomId, 200) || !isNonEmptyString(message, 300)) {
+            return;
+        }
+
+        if (!allowAction(socket.id, "chat", MAX_CHAT_MESSAGES_PER_10S, 10_000)) {
+            return;
+        }
+
+        const room = io.sockets.adapter.rooms.get(roomId);
+        if (!room || !room.has(socket.id)) return; // Socket ist gar nicht in dem Raum
+
+        io.to(roomId).emit("chat_message", {
+            id: crypto.randomUUID(),
+            senderId: socket.id,
+            message: message.slice(0, 300),
+            timestamp: Date.now(),
+        });
+    });
+
+    // =============================
+    // REMATCH
+    // =============================
+
+    socket.on("rematch_request", ({ roomId }) => {
+        if (!isNonEmptyString(roomId, 200)) return;
+
+        socket.to(roomId).emit("rematch_offer");
+        socket.emit("rematch_requested");
+    });
+
+    socket.on("rematch_answer", ({ roomId, accept }) => {
+        if (!isNonEmptyString(roomId, 200)) return;
+
+        if (accept) {
+            socket.to(roomId).emit("rematch_accepted");
+        } else {
+            socket.to(roomId).emit("rematch_declined");
+        }
+    });
+
+    // =============================
+    // DISCONNECT (mit Reconnect-Grace-Period)
+    // =============================
+
+    socket.on("disconnect", () => {
+        console.log("Disconnected:", socket.id);
+
+        const authId = socket.data.authId;
+
+        if (authId && authenticatedUsers.get(authId) === socket.id) {
+            authenticatedUsers.delete(authId);
+        }
+
+        removeFromQueue(socket.id);
+        rateBuckets.delete(socket.id);
+
+        const roomId = socketToRoom.get(socket.id);
+        if (!roomId) return;
+
+        const g = games.get(roomId);
+
+        if (g) {
+            const color = g.players.w === socket.id ? "w" : g.players.b === socket.id ? "b" : null;
+
+            if (color && authId) {
+                // Grace-Period: Gegner wird informiert, Spiel pausiert kurz
+                g.paused = true;
+
+                io.to(roomId).emit("opponent_disconnected", {
+                    color,
+                    graceMs: RECONNECT_GRACE_MS,
+                });
+
+                const timeout = setTimeout(() => {
+                    const stillMissing = games.get(roomId);
+                    if (!stillMissing) return;
+
+                    const winner = color === "w" ? stillMissing.players.b : stillMissing.players.w;
+
+                    io.to(roomId).emit("game_over", {
+                        type: "disconnect",
                         winner,
-                    }
-                );
+                    });
 
-                games.delete(
-                    roomId
-                );
+                    cleanupRoom(roomId);
+                }, RECONNECT_GRACE_MS);
+
+                disconnectTimers.set(roomId, { timeout, color, authId });
+                return; // Raum NICHT sofort aufräumen - wartet auf Reconnect
             }
-        );
 
-        // =============================
-        // DISCONNECT
-        // =============================
+            // Kein authId vorhanden -> kein Reconnect möglich, sofort werten
+            const winner = g.players.w === socket.id ? g.players.b : g.players.w;
 
-        socket.on(
-            "disconnect",
-            () => {
-                console.log(
-                    "Disconnected:",
-                    socket.id
-                );
+            io.to(roomId).emit("game_over", {
+                type: "disconnect",
+                winner,
+            });
 
-                // =========================
-                // AUTH USER CLEANUP
-                // =========================
+            cleanupRoom(roomId);
+            return;
+        }
 
-                const authId =
-                    socket.data.authId;
-
-                if (
-                    authId &&
-                    authenticatedUsers.get(
-                        authId
-                    ) ===
-                    socket.id
-                ) {
-                    authenticatedUsers.delete(
-                        authId
-                    );
-
-                    console.log(
-                        "AUTH SESSION REMOVED:",
-                        authId
-                    );
-                }
-
-                // =========================
-                // MATCHMAKING QUEUE
-                // =========================
-
-                const queueIndex =
-                    matchmakingQueue.findIndex(
-                        (player) =>
-                            player.id ===
-                            socket.id
-                    );
-
-                if (
-                    queueIndex !== -1
-                ) {
-                    matchmakingQueue.splice(
-                        queueIndex,
-                        1
-                    );
-
-                    console.log(
-                        "Removed disconnected player from matchmaking queue"
-                    );
-                }
-
-                // =========================
-                // GAME
-                // =========================
-
-                const roomId =
-                    socketToRoom.get(
-                        socket.id
-                    );
-
-                if (!roomId) {
-                    return;
-                }
-
-                const g =
-                    games.get(
-                        roomId
-                    );
-
-                if (g) {
-                    const winner =
-                        socket.id ===
-                            g.players.w
-                            ? g.players.b
-                            : g.players.w;
-
-                    io.to(
-                        roomId
-                    ).emit(
-                        "game_over",
-                        {
-                            type:
-                                "disconnect",
-
-                            winner,
-                        }
-                    );
-
-                    games.delete(
-                        roomId
-                    );
-                }
-
-                // =========================
-                // BOT
-                // =========================
-
-                const bot =
-                    botGames.get(
-                        roomId
-                    );
-
-                if (
-                    bot?.engine
-                ) {
-                    try {
-                        bot.engine.kill();
-                    } catch (
-                    error
-                    ) {
-                        console.log(
-                            "ENGINE KILL ERROR:",
-                            error
-                        );
-                    }
-                }
-
-                botGames.delete(
-                    roomId
-                );
-
-                socketToRoom.delete(
-                    socket.id
-                );
-            }
-        );
-    }
-);
+        // Bot-Spiel oder unbekannter Raum -> direkt aufräumen
+        cleanupRoom(roomId);
+    });
+});
 
 // ===========================
 // SERVER
 // ===========================
 
-const PORT =
-    process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-server.listen(
-    PORT,
-    () => {
-        console.log(
-            "Server running on",
-            PORT
-        );
-    }
-);
+server.listen(PORT, () => {
+    console.log("Server running on", PORT);
+});
