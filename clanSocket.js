@@ -98,9 +98,14 @@ async function recomputeLeague(clanId) {
 // authenticatedUsers: die Map<authId, socketId> aus dem Hauptserver,
 // damit wir online befindliche Nutzer direkt benachrichtigen können
 // (z.B. bei einer neuen Clan-Einladung oder einem Kick).
-
 export function setupClanHandlers(io, { authenticatedUsers }) {
+    if (!supabaseAdmin) {
+        console.warn("Clan-Feature deaktiviert - Supabase-Keys fehlen.");
+        return;
+    }
+
     const chatBuckets = new Map(); // socket.id -> timestamps[]
+    // ... Rest bleibt exakt gleich
 
     function allowChatMessage(socketId) {
         const now = Date.now();
