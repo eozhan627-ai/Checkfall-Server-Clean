@@ -6,7 +6,7 @@ import { spawn } from "child_process";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
 import crypto from "crypto";
-import {setupClanHandlers} from "./clanSocket.js";
+import { setupClanHandlers } from "./clanSocket.js";
 
 const app = express();
 
@@ -52,7 +52,7 @@ const io = new Server(server, {
         origin: ALLOWED_ORIGINS,
     },
 });
-setupClanHandlers(io, { authenticatedUsers }); 
+
 
 // =============================
 // STATE
@@ -70,7 +70,8 @@ const matchmakingQueue = [];
 
 // Simple per-socket rate limiting buckets
 const rateBuckets = new Map(); // socket.id -> { chat: number[], moves: number[] }
-
+// ============================= teest 
+setupClanHandlers(io, { authenticatedUsers });
 function getBucket(socketId) {
     if (!rateBuckets.has(socketId)) {
         rateBuckets.set(socketId, { chat: [], moves: [] });
