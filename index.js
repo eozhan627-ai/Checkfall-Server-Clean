@@ -6,6 +6,7 @@ import { spawn } from "child_process";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
 import crypto from "crypto";
+import {setupClanHandlers} from "./clanSocket.js";
 
 const app = express();
 
@@ -51,6 +52,7 @@ const io = new Server(server, {
         origin: ALLOWED_ORIGINS,
     },
 });
+setupClanHandlers(io, { authenticatedUsers }); 
 
 // =============================
 // STATE
