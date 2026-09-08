@@ -217,6 +217,25 @@ function removeFromQueue(socketId) {
     }
 }
 
+setInterval(() => {
+    for (let i = 0; i < matchmakingQueue.length; i++) {
+        const player = matchmakingQueue[i];
+        const opponentSocket = io.sockets.sockets.get(player.id);
+        if (!opponentSocket) {
+            matchmakingQueue.splice(i, 1);
+            i--;
+            continue;
+        }
+
+        const opponent = findMatchForPlayer(player);
+        if (opponent) {
+            matchmakingQueue.splice(matchmakingQueue.indexOf(player), 1);
+            startPvPGame(player, opponent); // deine bestehende Match-Logik extrahieren
+            break; // Queue hat sich verändert, neuer Durchlauf beim nächsten Tick
+        }
+    }
+}, 3000);
+
 // =============================
 // TIMER (PvP)
 // =============================
@@ -259,6 +278,8 @@ setInterval(() => {
         });
     }
 }, 1000);
+
+
 
 // =============================
 // ROOM CLEANUP
@@ -375,7 +396,59 @@ function getEngine(botState, roomId) {
 
     return engine;
 }
+function startPvPGame(playerA, playerB) {
+    const roomId = `${crypto.randomUUID()}`;
 
+    io.sockets.sockets.get(playerA.id)?.join(roomId);
+    io.sockets.sockets.get(playerB.id)?.join(roomId);
+
+    const game = createPvPGame();
+
+    // Wer länger gewartet hat, bekommt Weiß.
+    const white = playerA.joinedAt <= playerB.joinedAt ? playerA : playerB;
+    const black = white === playerA ? playerB : playerA;
+
+    game.players.w = white.id;
+    game.players.b = black.id;
+    game.authIds.w = white.authId;
+    game.authIds.b = black.authId;
+    game.ratings.w = white.rating;
+    game.ratings.b = black.rating;
+
+    games.set(roomId, game);
+
+    socketToRoom.set(white.id, roomId);
+    socketToRoom.set(black.id, roomId);
+
+    if (white.authId) authIdToRoom.set(white.authId, roomId);
+    if (black.authId) authIdToRoom.set(black.authId, roomId);
+
+    io.to(roomId).emit("game_start", {
+        roomId,
+        white: white.id,
+        black: black.id,
+        whiteName: white.name,
+        blackName: black.name,
+        whiteAvatar: white.avatar,
+        blackAvatar: black.avatar,
+        whiteRating: white.rating,
+        blackRating: black.rating,
+        whiteAuthId: white.authId,
+        blackAuthId: black.authId,
+        whiteTime: game.whiteTime,
+        blackTime: game.blackTime,
+        increment: game.increment,
+    });
+
+    console.log("MATCH FOUND:", {
+        roomId,
+        white: white.name,
+        whiteRating: white.rating,
+        black: black.name,
+        blackRating: black.rating,
+        difference: Math.abs(white.rating - black.rating),
+    });
+}
 function startBotMove(roomId) {
     const botState = botGames.get(roomId);
     if (!botState) return;
@@ -601,54 +674,7 @@ io.on("connection", (socket) => {
             return;
         }
 
-        const roomId = `${crypto.randomUUID()}`;
-
-        socket.join(roomId);
-        io.sockets.sockets.get(opponent.id)?.join(roomId);
-
-        const game = createPvPGame();
-
-        // Wer länger gewartet hat, bekommt Weiß.
-        game.players.w = opponent.id;
-        game.players.b = player.id;
-        game.authIds.w = opponent.authId;
-        game.authIds.b = player.authId;
-        game.ratings.w = opponent.rating;
-        game.ratings.b = player.rating;
-
-        games.set(roomId, game);
-
-        socketToRoom.set(opponent.id, roomId);
-        socketToRoom.set(player.id, roomId);
-
-        if (opponent.authId) authIdToRoom.set(opponent.authId, roomId);
-        if (player.authId) authIdToRoom.set(player.authId, roomId);
-
-        io.to(roomId).emit("game_start", {
-            roomId,
-            white: opponent.id,
-            black: player.id,
-            whiteName: opponent.name,
-            blackName: player.name,
-            whiteAvatar: opponent.avatar,
-            blackAvatar: player.avatar,
-            whiteRating: opponent.rating,
-            blackRating: player.rating,
-            whiteAuthId: opponent.authId, // NEU: für dauerhaftes "Freund hinzufügen"
-            blackAuthId: player.authId, // NEU
-            whiteTime: game.whiteTime,
-            blackTime: game.blackTime,
-            increment: game.increment,
-        });
-
-        console.log("MATCH FOUND:", {
-            roomId,
-            white: opponent.name,
-            whiteRating: opponent.rating,
-            black: player.name,
-            blackRating: player.rating,
-            difference: Math.abs(opponent.rating - player.rating),
-        });
+        startPvPGame(player, opponent);
     });
 
     socket.on("cancel_matchmaking", () => {
