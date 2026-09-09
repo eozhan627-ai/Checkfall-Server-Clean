@@ -70,7 +70,7 @@ const matchmakingQueue = [];
 
 // Simple per-socket rate limiting buckets
 const rateBuckets = new Map(); // socket.id -> { chat: number[], moves: number[] }
-// ============================= teest 
+// ============================= teest
 setupClanHandlers(io, { authenticatedUsers });
 function getBucket(socketId) {
     if (!rateBuckets.has(socketId)) {
@@ -104,17 +104,39 @@ function isValidSquare(value) {
     return typeof value === "string" && /^[a-h][1-8]$/.test(value);
 }
 
-function isValidMovePayload(move) {
-    if (!move || typeof move !== "object") return false;
-    if (!isValidSquare(move.from) || !isValidSquare(move.to)) return false;
-    if (
-        move.promotion !== undefined &&
-        move.promotion !== null &&
-        !["q", "r", "b", "n"].includes(move.promotion)
-    ) {
-        return false;
+// Der Client sollte {from, to, promotion?} als Objekt schicken. Aus Robustheit
+// akzeptieren wir hier zusätzlich einen reinen UCI-String ("e2e4" / "e7e8q"),
+// falls irgendein Client-Pfad noch dieses Format verwendet - vorher wurde ein
+// String-Payload stillschweigend verworfen (typeof move !== "object"), wodurch
+// Serverspiel und Client komplett auseinanderliefen und der Bot nie mehr am Zug war.
+function normalizeMovePayload(rawMove) {
+    if (typeof rawMove === "string") {
+        const match = /^([a-h][1-8])([a-h][1-8])([qrbn])?$/.exec(rawMove.trim());
+        if (!match) return null;
+
+        const [, from, to, promotion] = match;
+        return { from, to, promotion: promotion || undefined };
     }
-    return true;
+
+    if (rawMove && typeof rawMove === "object") {
+        if (!isValidSquare(rawMove.from) || !isValidSquare(rawMove.to)) return null;
+
+        if (
+            rawMove.promotion !== undefined &&
+            rawMove.promotion !== null &&
+            !["q", "r", "b", "n"].includes(rawMove.promotion)
+        ) {
+            return null;
+        }
+
+        return {
+            from: rawMove.from,
+            to: rawMove.to,
+            promotion: rawMove.promotion || undefined,
+        };
+    }
+
+    return null;
 }
 
 // =============================
@@ -330,6 +352,21 @@ function getEngine(botState, roomId) {
 
     engine.on("error", (err) => {
         console.error("ENGINE SPAWN ERROR:", err);
+    });
+
+    engine.on("exit", (code, signal) => {
+        console.log("ENGINE EXITED:", { roomId, code, signal });
+
+        // Falls die Engine unerwartet stirbt, während der Raum noch existiert,
+        // Referenz zurücksetzen, damit getEngine() beim nächsten Zug neu spawnt,
+        // statt dass der Bot für immer stumm bleibt.
+        const stillHere = botGames.get(roomId);
+        if (stillHere && stillHere.engine === engine) {
+            stillHere.engine = null;
+            stillHere.engineReady = false;
+            stillHere.thinking = false;
+            stillHere.pending = false;
+        }
     });
 
     engine.stdout.on("data", (data) => {
@@ -742,7 +779,13 @@ io.on("connection", (socket) => {
 
         getEngine(botState, roomId);
 
-        if (botIsWhite && game.turn() === "w") {
+        // Falls der Bot bereits am Zug ist (egal welche Farbe - z.B. auch beim
+        // Fortsetzen eines gespeicherten Spiels, bei dem Schwarz am Zug ist und
+        // der Bot Schwarz spielt), Zug anstoßen. Vorher wurde hier nur der
+        // Sonderfall "Bot ist Weiß und Zug 1" abgedeckt; alle anderen Fälle
+        // hingen komplett vom "readyok"-Callback der Engine ab, was bei einer
+        // bereits laufenden/wiederverwendeten Engine nie erneut feuert.
+        if (game.turn() === botState.botColor) {
             setTimeout(() => startBotMove(roomId), 500);
         }
     });
@@ -751,8 +794,14 @@ io.on("connection", (socket) => {
     // PLAYER MOVE
     // =============================
 
-    socket.on("player_move", ({ roomId, move }) => {
-        if (!isNonEmptyString(roomId, 200) || !isValidMovePayload(move)) {
+    socket.on("player_move", ({ roomId, move: rawMove }) => {
+        if (!isNonEmptyString(roomId, 200)) {
+            return;
+        }
+
+        const move = normalizeMovePayload(rawMove);
+        if (!move) {
+            console.log("MOVE REJECTED: invalid payload", { roomId, rawMove });
             return;
         }
 
