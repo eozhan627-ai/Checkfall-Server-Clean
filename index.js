@@ -14,13 +14,11 @@ const app = express();
 // SECURITY / CONFIG
 // =============================
 
-// Setze ALLOWED_ORIGINS in der .env, z.B. "https://meineapp.com,https://admin.meineapp.com"
-// Fällt im Dev-Fall auf "*" zurück, damit lokale Tests weiter funktionieren.
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
     : "*";
 
-const RECONNECT_GRACE_MS = 25_000; // Zeit, die ein Spieler nach Disconnect hat, um zurückzukommen
+const RECONNECT_GRACE_MS = 25_000;
 const MAX_CHAT_MESSAGES_PER_10S = 8;
 const MAX_MOVES_PER_2S = 12;
 
@@ -58,19 +56,17 @@ const io = new Server(server, {
 // STATE
 // =============================
 
-const games = new Map(); // roomId -> pvp game state
-const botGames = new Map(); // roomId -> bot game state
+const games = new Map();
+const botGames = new Map();
 
-const socketToRoom = new Map(); // socket.id -> roomId
-const authenticatedUsers = new Map(); // authId -> socket.id
-const authIdToRoom = new Map(); // authId -> roomId (survives disconnect, used for reconnect)
-const disconnectTimers = new Map(); // roomId -> { timeout, color, authId }
+const socketToRoom = new Map();
+const authenticatedUsers = new Map();
+const authIdToRoom = new Map();
+const disconnectTimers = new Map();
 
 const matchmakingQueue = [];
 
-// Simple per-socket rate limiting buckets
-const rateBuckets = new Map(); // socket.id -> { chat: number[], moves: number[] }
-// ============================= teest
+const rateBuckets = new Map();
 setupClanHandlers(io, { authenticatedUsers });
 function getBucket(socketId) {
     if (!rateBuckets.has(socketId)) {
@@ -104,11 +100,6 @@ function isValidSquare(value) {
     return typeof value === "string" && /^[a-h][1-8]$/.test(value);
 }
 
-// Der Client sollte {from, to, promotion?} als Objekt schicken. Aus Robustheit
-// akzeptieren wir hier zusätzlich einen reinen UCI-String ("e2e4" / "e7e8q"),
-// falls irgendein Client-Pfad noch dieses Format verwendet - vorher wurde ein
-// String-Payload stillschweigend verworfen (typeof move !== "object"), wodurch
-// Serverspiel und Client komplett auseinanderliefen und der Bot nie mehr am Zug war.
 function normalizeMovePayload(rawMove) {
     if (typeof rawMove === "string") {
         const match = /^([a-h][1-8])([a-h][1-8])([qrbn])?$/.exec(rawMove.trim());
@@ -151,40 +142,109 @@ function createPvPGame() {
         increment: 2000,
         activeColor: "w",
         lastTick: Date.now(),
-        paused: false, // true während einer Reconnect-Grace-Period
+        paused: false,
         players: { w: null, b: null },
         authIds: { w: null, b: null },
         ratings: { w: 1000, b: 1000 },
     };
 }
 
-// Level ist eine grobe Spielstärke 0-20 (UCI Skill Level).
-// Falls dein Client größere Werte schickt (z.B. eine Elo-artige Zahl),
-// wird hier heruntergerechnet - Mapping ggf. an deine Client-Skala anpassen.
-function normalizeSkillLevel(rawLevel) {
-    const n = Number(rawLevel);
-    if (!Number.isFinite(n)) return 10;
+// =============================
+// BOT-STÄRKE / ELO-KALIBRIERUNG
+// =============================
 
-    if (n <= 20) {
-        return Math.min(20, Math.max(0, Math.round(n)));
-    }
+// Der Slider im Client geht 0 (bzw. 100) bis 3200. Ab 3200 spielt die Engine
+// mit voller Stärke (kein UCI_LimitStrength).
+const ELO_MIN = 0;
+const ELO_MAX = 3200;
 
-    // z.B. 300 -> ca. Skill 6
-    return Math.min(20, Math.max(0, Math.round(n / 50)));
+// Native Grenzen, in denen Stockfish selbst über UCI_Elo kalibriert - hängt
+// von der Engine-Version ab! Beim Start wird geloggt, was deine Binary
+// tatsächlich als min/max für UCI_Elo meldet (siehe "option name UCI_Elo"
+// im Log) - diese beiden Werte ggf. daran anpassen.
+const ENGINE_ELO_MIN = 1320;
+const ENGINE_ELO_MAX = 3190;
+
+// Wie viele Kandidatenzüge wir uns von der Engine geben lassen, um daraus
+// im "weak mode" (Ziel-Elo unter ENGINE_ELO_MIN) gewichtet einen auszuwählen
+// statt immer stur den Top-Zug zu spielen.
+const WEAK_MODE_MULTIPV = 8;
+
+function computeEloProfile(rawElo) {
+    const n = Number(rawElo);
+    const targetElo = Number.isFinite(n)
+        ? Math.min(ELO_MAX, Math.max(ELO_MIN, Math.round(n)))
+        : 300;
+
+    const fullStrength = targetElo >= ELO_MAX;
+    const engineElo = Math.min(ENGINE_ELO_MAX, Math.max(ENGINE_ELO_MIN, targetElo));
+
+    // 0 = an der nativen Engine-Untergrenze, 1 = ganz unten (Elo 0).
+    // Steuert, wie stark wir zusätzlich zu UCI_Elo künstlich "Patzer"
+    // einstreuen (die Engine selbst spielt unterhalb ihrer eigenen
+    // UCI_Elo-Untergrenze i.d.R. nicht mehr spürbar schwächer).
+    const belowFloorRatio =
+        targetElo >= ENGINE_ELO_MIN
+            ? 0
+            : (ENGINE_ELO_MIN - targetElo) / ENGINE_ELO_MIN;
+
+    return {
+        targetElo,
+        fullStrength,
+        engineElo,
+        belowFloorRatio,
+        weakMode: belowFloorRatio > 0,
+    };
 }
 
-function createBotGame(level = 300) {
-    const skill = normalizeSkillLevel(level);
+// Wählt aus den (bereits nach cp absteigend sortierten) Kandidatenzügen
+// gewichtet einen aus. Je höher belowFloorRatio, desto "flacher" die
+// Gewichtung (mehr Ungenauigkeiten) und desto größer die Chance auf einen
+// echten Patzer (schwächster der Kandidaten wird gespielt - z.B. eine
+// Figur, die dabei hängen bleibt).
+function chooseWeightedMove(candidates, belowFloorRatio) {
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0].uci;
+
+    const best = candidates[0].cp;
+
+    // Temperatur in "Centipawn": klein = fast immer bester Zug,
+    // groß = auch deutlich schwächere Kandidaten werden regelmäßig gespielt.
+    const temperature = 35 + belowFloorRatio * 220;
+
+    const blunderChance = belowFloorRatio * 0.16; // bis zu ~16% bei Elo 0
+    if (Math.random() < blunderChance) {
+        return candidates[candidates.length - 1].uci;
+    }
+
+    const weights = candidates.map((c) => Math.exp(-(best - c.cp) / temperature));
+    const total = weights.reduce((a, b) => a + b, 0);
+
+    let r = Math.random() * total;
+    for (let i = 0; i < candidates.length; i++) {
+        r -= weights[i];
+        if (r <= 0) return candidates[i].uci;
+    }
+
+    return candidates[candidates.length - 1].uci;
+}
+
+function createBotGame(rawElo = 300) {
+    const profile = computeEloProfile(rawElo);
 
     return {
         game: new Chess(),
-        skill,
-        depth: Math.max(2, Math.round(2 + skill * 0.65)), // grob 2-15
+        elo: profile.targetElo,
+        fullStrength: profile.fullStrength,
+        engineElo: profile.engineElo,
+        belowFloorRatio: profile.belowFloorRatio,
+        weakMode: profile.weakMode,
         botColor: "b",
         thinking: false,
         pending: false,
         engine: null,
         engineReady: false,
+        multipvInfo: new Map(), // multipv-Index -> { cp, uci } der aktuellen Suche
     };
 }
 
@@ -252,8 +312,8 @@ setInterval(() => {
         const opponent = findMatchForPlayer(player);
         if (opponent) {
             matchmakingQueue.splice(matchmakingQueue.indexOf(player), 1);
-            startPvPGame(player, opponent); // deine bestehende Match-Logik extrahieren
-            break; // Queue hat sich verändert, neuer Durchlauf beim nächsten Tick
+            startPvPGame(player, opponent);
+            break;
         }
     }
 }, 3000);
@@ -267,7 +327,6 @@ setInterval(() => {
 
     for (const [roomId, g] of games.entries()) {
         if (g.paused) {
-            // Uhr läuft während einer Reconnect-Grace-Period nicht weiter.
             g.lastTick = now;
             continue;
         }
@@ -357,9 +416,6 @@ function getEngine(botState, roomId) {
     engine.on("exit", (code, signal) => {
         console.log("ENGINE EXITED:", { roomId, code, signal });
 
-        // Falls die Engine unerwartet stirbt, während der Raum noch existiert,
-        // Referenz zurücksetzen, damit getEngine() beim nächsten Zug neu spawnt,
-        // statt dass der Bot für immer stumm bleibt.
         const stillHere = botGames.get(roomId);
         if (stillHere && stillHere.engine === engine) {
             stillHere.engine = null;
@@ -378,10 +434,29 @@ function getEngine(botState, roomId) {
         for (let line of lines) {
             line = line.trim();
 
+            // Nur zur Kontrolle beim Start: zeigt dir, welchen Elo-Bereich
+            // deine konkrete Stockfish-Version für UCI_Elo tatsächlich
+            // unterstützt - ENGINE_ELO_MIN/MAX oben ggf. daran anpassen.
+            if (
+                line.startsWith("option name UCI_Elo") ||
+                line.startsWith("option name UCI_LimitStrength") ||
+                line.startsWith("option name MultiPV")
+            ) {
+                console.log("ENGINE OPTION:", line);
+            }
+
             if (line === "uciok") {
-                engine.stdin.write(
-                    `setoption name Skill Level value ${botState.skill}\n`
-                );
+                if (botState.fullStrength) {
+                    engine.stdin.write("setoption name UCI_LimitStrength value false\n");
+                    engine.stdin.write("setoption name Skill Level value 20\n");
+                    engine.stdin.write("setoption name MultiPV value 1\n");
+                } else {
+                    engine.stdin.write("setoption name UCI_LimitStrength value true\n");
+                    engine.stdin.write(`setoption name UCI_Elo value ${botState.engineElo}\n`);
+                    engine.stdin.write(
+                        `setoption name MultiPV value ${botState.weakMode ? WEAK_MODE_MULTIPV : 1}\n`
+                    );
+                }
                 engine.stdin.write("isready\n");
             }
 
@@ -393,26 +468,80 @@ function getEngine(botState, roomId) {
                 }
             }
 
+            // Kandidatenzüge während der Suche sammeln (nur relevant im
+            // weak mode, wo MultiPV > 1 gesetzt ist).
+            if (botState.weakMode && line.startsWith("info") && line.includes(" pv ")) {
+                const mpvMatch = line.match(/multipv (\d+)/);
+                const scoreMatch = line.match(/score (cp|mate) (-?\d+)/);
+                const pvMatch = line.match(/ pv (.+)$/);
+
+                if (mpvMatch && scoreMatch && pvMatch) {
+                    const idx = parseInt(mpvMatch[1], 10);
+                    let cp = parseInt(scoreMatch[2], 10);
+
+                    if (scoreMatch[1] === "mate") {
+                        cp = cp > 0 ? 100000 - cp : -100000 - cp;
+                    }
+
+                    const firstMove = pvMatch[1].trim().split(" ")[0];
+
+                    if (firstMove) {
+                        botState.multipvInfo.set(idx, { cp, uci: firstMove });
+                    }
+                }
+            }
+
             if (line.startsWith("bestmove")) {
-                const uci = line.split(" ")[1];
+                const engineUci = line.split(" ")[1];
 
                 botState.thinking = false;
                 botState.pending = false;
 
-                if (!uci || uci === "(none)") {
+                let chosenUci = engineUci;
+
+                // Im weak mode NICHT immer den Top-Zug der Engine spielen,
+                // sondern gewichtet einen der gesammelten Kandidaten wählen -
+                // das simuliert menschliche Ungenauigkeiten/Patzer.
+                if (botState.weakMode && botState.multipvInfo.size > 0) {
+                    const candidates = Array.from(botState.multipvInfo.values())
+                        .filter((c) => c.uci && c.uci !== "(none)")
+                        .sort((a, b) => b.cp - a.cp);
+
+                    const picked = chooseWeightedMove(candidates, botState.belowFloorRatio);
+                    if (picked) chosenUci = picked;
+                }
+
+                if (!chosenUci || chosenUci === "(none)") {
                     return;
                 }
 
-                const from = uci.slice(0, 2);
-                const to = uci.slice(2, 4);
-                const promotion = uci[4];
+                const from = chosenUci.slice(0, 2);
+                const to = chosenUci.slice(2, 4);
+                const promotion = chosenUci[4];
 
                 let result;
                 try {
                     result = botState.game.move({ from, to, promotion });
                 } catch (error) {
-                    console.log("BOT MOVE REJECTED:", uci, error?.message);
-                    return;
+                    console.log("BOT MOVE REJECTED:", chosenUci, error?.message);
+
+                    // Falls unser künstlich gewählter "Patzer-Zug" doch mal
+                    // ungültig sein sollte, auf den echten Engine-Zug
+                    // zurückfallen, statt dass der Bot stumm bleibt.
+                    if (chosenUci !== engineUci && engineUci && engineUci !== "(none)") {
+                        try {
+                            result = botState.game.move({
+                                from: engineUci.slice(0, 2),
+                                to: engineUci.slice(2, 4),
+                                promotion: engineUci[4],
+                            });
+                        } catch (fallbackError) {
+                            console.log("BOT FALLBACK MOVE REJECTED:", engineUci, fallbackError?.message);
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
                 }
 
                 if (!result) return;
@@ -441,7 +570,6 @@ function startPvPGame(playerA, playerB) {
 
     const game = createPvPGame();
 
-    // Wer länger gewartet hat, bekommt Weiß.
     const white = playerA.joinedAt <= playerB.joinedAt ? playerA : playerB;
     const black = white === playerA ? playerB : playerA;
 
@@ -486,6 +614,25 @@ function startPvPGame(playerA, playerB) {
         difference: Math.abs(white.rating - black.rating),
     });
 }
+
+// Simulierte Bedenkzeit: kurz & gleichmäßig in der Eröffnung, danach
+// variabler im Mittel-/Endspiel. "go movetime X" lässt die Engine
+// tatsächlich diese Zeit lang rechnen, statt nur einen Timer davor zu hängen.
+function getBotThinkTimeMs(pliesPlayed, fullStrength) {
+    if (fullStrength) {
+        // Volle Stärke darf ruhig etwas länger "nachdenken".
+        return 1200 + Math.round(Math.random() * 1300); // 1.2s - 2.5s
+    }
+
+    const OPENING_PLY_THRESHOLD = 6; // ~3 Züge pro Seite
+
+    if (pliesPlayed < OPENING_PLY_THRESHOLD) {
+        return 800 + Math.round(Math.random() * 200); // ~0.8s - 1.0s
+    }
+
+    return 700 + Math.round(Math.random() * 1300); // 0.7s - 2.0s
+}
+
 function startBotMove(roomId) {
     const botState = botGames.get(roomId);
     if (!botState) return;
@@ -498,12 +645,17 @@ function startBotMove(roomId) {
     botState.pending = true;
     botState.thinking = true;
 
+    const pliesPlayed = botState.game.history().length;
+    const thinkTimeMs = getBotThinkTimeMs(pliesPlayed, botState.fullStrength);
+
     setTimeout(() => {
         if (!botGames.has(roomId)) return; // Raum wurde inzwischen aufgeräumt
 
+        botState.multipvInfo = new Map(); // Kandidaten der vorigen Suche verwerfen
+
         engine.stdin.write(`position fen ${botState.game.fen()}\n`);
-        engine.stdin.write(`go depth ${botState.depth}\n`);
-    }, 300);
+        engine.stdin.write(`go movetime ${thinkTimeMs}\n`);
+    }, 50);
 }
 
 function emitGameOverIfBotGameEnded(roomId, botState) {
@@ -513,7 +665,7 @@ function emitGameOverIfBotGameEnded(roomId, botState) {
     let payload;
 
     if (botState.game.isCheckmate()) {
-        const winnerIsBot = botState.game.turn() === humanColor; // der Spieler, der dran ist, wurde matt gesetzt
+        const winnerIsBot = botState.game.turn() === humanColor;
         payload = { type: "checkmate", winner: winnerIsBot ? "bot" : "human" };
     } else {
         payload = { type: "draw" };
@@ -569,10 +721,6 @@ app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
 io.on("connection", (socket) => {
     console.log("Connected:", socket.id);
 
-    // =============================
-    // AUTHENTICATED USER + RECONNECT
-    // =============================
-
     socket.on("authenticate_socket", (data) => {
         const authId = data?.authId;
 
@@ -606,7 +754,6 @@ io.on("connection", (socket) => {
 
         socket.emit("socket_authenticated");
 
-        // ==== RECONNECT: gibt es ein laufendes Spiel für diesen authId? ====
         const roomId = authIdToRoom.get(authId);
         const g = roomId ? games.get(roomId) : null;
 
@@ -615,7 +762,6 @@ io.on("connection", (socket) => {
         const color = g.authIds.w === authId ? "w" : g.authIds.b === authId ? "b" : null;
         if (!color) return;
 
-        // Alten (toten) Socket-Eintrag durch den neuen ersetzen
         g.players[color] = socket.id;
         socketToRoom.set(socket.id, roomId);
         socket.join(roomId);
@@ -640,8 +786,8 @@ io.on("connection", (socket) => {
             increment: g.increment,
             whiteRating: g.ratings.w,
             blackRating: g.ratings.b,
-            whiteAuthId: g.authIds.w, // NEU: für dauerhaftes "Freund hinzufügen"
-            blackAuthId: g.authIds.b, // NEU
+            whiteAuthId: g.authIds.w,
+            blackAuthId: g.authIds.b,
             resumed: true,
         });
 
@@ -649,10 +795,6 @@ io.on("connection", (socket) => {
 
         console.log("PLAYER RECONNECTED:", { authId, roomId, color });
     });
-
-    // =============================
-    // FRIENDS: ONLINE STATUS
-    // =============================
 
     socket.on("check_friends_online", (data) => {
         const authIds = Array.isArray(data?.authIds)
@@ -663,10 +805,6 @@ io.on("connection", (socket) => {
 
         socket.emit("friends_online_status", { online });
     });
-
-    // =============================
-    // PvP MATCHMAKING
-    // =============================
 
     socket.on("find_match", (data) => {
         if (matchmakingQueue.some((p) => p.id === socket.id)) {
@@ -719,10 +857,6 @@ io.on("connection", (socket) => {
         socket.emit("matchmaking_cancelled");
     });
 
-    // =============================
-    // BOT MATCH
-    // =============================
-
     socket.on("find_bot_match", (data) => {
         const roomId = `bot_${socket.id}`;
 
@@ -773,26 +907,18 @@ io.on("connection", (socket) => {
             roomId,
             playerColor: playerIsWhite ? "w" : "b",
             botColor: botState.botColor,
-            skill: botState.skill,
-            depth: botState.depth,
+            targetElo: botState.elo,
+            fullStrength: botState.fullStrength,
+            engineElo: botState.engineElo,
+            weakMode: botState.weakMode,
         });
 
         getEngine(botState, roomId);
 
-        // Falls der Bot bereits am Zug ist (egal welche Farbe - z.B. auch beim
-        // Fortsetzen eines gespeicherten Spiels, bei dem Schwarz am Zug ist und
-        // der Bot Schwarz spielt), Zug anstoßen. Vorher wurde hier nur der
-        // Sonderfall "Bot ist Weiß und Zug 1" abgedeckt; alle anderen Fälle
-        // hingen komplett vom "readyok"-Callback der Engine ab, was bei einer
-        // bereits laufenden/wiederverwendeten Engine nie erneut feuert.
         if (game.turn() === botState.botColor) {
             setTimeout(() => startBotMove(roomId), 500);
         }
     });
-
-    // =============================
-    // PLAYER MOVE
-    // =============================
 
     socket.on("player_move", ({ roomId, move: rawMove }) => {
         if (!isNonEmptyString(roomId, 200)) {
@@ -809,17 +935,13 @@ io.on("connection", (socket) => {
             return;
         }
 
-        // =========================
-        // BOT
-        // =========================
-
         const bot = botGames.get(roomId);
 
         if (bot) {
             const humanColor = bot.botColor === "w" ? "b" : "w";
 
             if (bot.game.turn() !== humanColor) {
-                return; // nicht der Zug des Spielers
+                return;
             }
 
             let result;
@@ -845,10 +967,6 @@ io.on("connection", (socket) => {
 
             return;
         }
-
-        // =========================
-        // PvP
-        // =========================
 
         const g = games.get(roomId);
         if (!g) return;
@@ -915,10 +1033,6 @@ io.on("connection", (socket) => {
         }
     });
 
-    // =============================
-    // DRAW OFFER / ANSWER
-    // =============================
-
     socket.on("offer_draw", ({ roomId }) => {
         if (!isNonEmptyString(roomId, 200)) return;
 
@@ -946,10 +1060,6 @@ io.on("connection", (socket) => {
         }
     });
 
-    // =============================
-    // RESIGN
-    // =============================
-
     socket.on("resign_game", ({ roomId }) => {
         if (!isNonEmptyString(roomId, 200)) return;
 
@@ -963,10 +1073,6 @@ io.on("connection", (socket) => {
         cleanupRoom(roomId);
     });
 
-    // =============================
-    // CHAT
-    // =============================
-
     socket.on("send_chat_message", ({ roomId, message }) => {
         if (!isNonEmptyString(roomId, 200) || !isNonEmptyString(message, 300)) {
             return;
@@ -977,7 +1083,7 @@ io.on("connection", (socket) => {
         }
 
         const room = io.sockets.adapter.rooms.get(roomId);
-        if (!room || !room.has(socket.id)) return; // Socket ist gar nicht in dem Raum
+        if (!room || !room.has(socket.id)) return;
 
         io.to(roomId).emit("chat_message", {
             id: crypto.randomUUID(),
@@ -986,10 +1092,6 @@ io.on("connection", (socket) => {
             timestamp: Date.now(),
         });
     });
-
-    // =============================
-    // REMATCH
-    // =============================
 
     socket.on("rematch_request", ({ roomId }) => {
         if (!isNonEmptyString(roomId, 200)) return;
@@ -1007,10 +1109,6 @@ io.on("connection", (socket) => {
             socket.to(roomId).emit("rematch_declined");
         }
     });
-
-    // =============================
-    // DISCONNECT (mit Reconnect-Grace-Period)
-    // =============================
 
     socket.on("disconnect", () => {
         console.log("Disconnected:", socket.id);
@@ -1033,7 +1131,6 @@ io.on("connection", (socket) => {
             const color = g.players.w === socket.id ? "w" : g.players.b === socket.id ? "b" : null;
 
             if (color && authId) {
-                // Grace-Period: Gegner wird informiert, Spiel pausiert kurz
                 g.paused = true;
 
                 io.to(roomId).emit("opponent_disconnected", {
@@ -1056,10 +1153,9 @@ io.on("connection", (socket) => {
                 }, RECONNECT_GRACE_MS);
 
                 disconnectTimers.set(roomId, { timeout, color, authId });
-                return; // Raum NICHT sofort aufräumen - wartet auf Reconnect
+                return;
             }
 
-            // Kein authId vorhanden -> kein Reconnect möglich, sofort werten
             const winner = g.players.w === socket.id ? g.players.b : g.players.w;
 
             io.to(roomId).emit("game_over", {
@@ -1071,7 +1167,6 @@ io.on("connection", (socket) => {
             return;
         }
 
-        // Bot-Spiel oder unbekannter Raum -> direkt aufräumen
         cleanupRoom(roomId);
     });
 });
