@@ -7,6 +7,8 @@ import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
 import crypto from "crypto";
 import { setupClanHandlers } from "./clanSocket.js";
+import { setupClanHandlers } from "./clanSocket.js";
+import { setupAnalysisHandlers } from "./stockfishSocket.js"; // NEU
 
 const app = express();
 
@@ -68,6 +70,7 @@ const matchmakingQueue = [];
 
 const rateBuckets = new Map();
 setupClanHandlers(io, { authenticatedUsers });
+setupAnalysisHandlers(io); // NEU
 function getBucket(socketId) {
     if (!rateBuckets.has(socketId)) {
         rateBuckets.set(socketId, { chat: [], moves: [] });
