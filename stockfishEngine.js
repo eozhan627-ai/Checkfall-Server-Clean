@@ -1,16 +1,14 @@
 import { spawn } from "child_process";
 
-const STOCKFISH_PATH = "/usr/games/stockfish"; // gleicher Pfad wie im Bot-Code
+const STOCKFISH_PATH = "/usr/games/stockfish";
 
 export function createAnalysisEngine() {
     return new Promise((resolve, reject) => {
         const engine = spawn(STOCKFISH_PATH);
         let buffer = "";
-        let ready = false;
+        let uciReady = false;
 
-        engine.on("error", (err) => {
-            reject(err);
-        });
+        engine.on("error", (err) => reject(err));
 
         engine.stdout.on("data", (data) => {
             buffer += data.toString();
@@ -18,8 +16,15 @@ export function createAnalysisEngine() {
             buffer = lines.pop();
 
             for (const line of lines) {
-                if (line.trim() === "uciok" && !ready) {
-                    ready = true;
+                const trimmed = line.trim();
+
+                if (trimmed === "uciok" && !uciReady) {
+                    uciReady = true;
+                    engine.stdin.write("setoption name MultiPV value 2\n");
+                    engine.stdin.write("isready\n");
+                }
+
+                if (trimmed === "readyok") {
                     resolve(engine);
                 }
             }
@@ -28,14 +33,14 @@ export function createAnalysisEngine() {
         engine.stdin.write("uci\n");
 
         setTimeout(() => {
-            if (!ready) reject(new Error("STOCKFISH_INIT_TIMEOUT"));
+            if (!uciReady) reject(new Error("STOCKFISH_INIT_TIMEOUT"));
         }, 5000);
     });
 }
 
 export function evaluatePosition(engine, fen, depth) {
     return new Promise((resolve) => {
-        let lastScore = null;
+        const scores = {};
         let bestMove = null;
         let buffer = "";
 
@@ -45,10 +50,13 @@ export function evaluatePosition(engine, fen, depth) {
             buffer = lines.pop();
 
             for (const line of lines) {
+                const mpvMatch = line.match(/multipv (\d+)/);
                 const scoreMatch = line.match(/score (cp|mate) (-?\d+)/);
-                if (scoreMatch) {
+
+                if (mpvMatch && scoreMatch) {
+                    const idx = parseInt(mpvMatch[1], 10);
                     const [, type, value] = scoreMatch;
-                    lastScore =
+                    scores[idx] =
                         type === "mate"
                             ? Number(value) > 0 ? 10000 : -10000
                             : Number(value);
@@ -57,7 +65,11 @@ export function evaluatePosition(engine, fen, depth) {
                 if (line.startsWith("bestmove")) {
                     bestMove = line.split(" ")[1];
                     engine.stdout.off("data", onData);
-                    resolve({ evalCp: lastScore, bestMove });
+                    resolve({
+                        evalCp: scores[1] ?? null,
+                        secondEvalCp: scores[2] ?? null,
+                        bestMove,
+                    });
                     return;
                 }
             }
