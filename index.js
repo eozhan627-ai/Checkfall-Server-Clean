@@ -7,8 +7,10 @@ import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
 import crypto from "crypto";
 import { setupClanHandlers } from "./clanSocket.js";
-
+import { setupCoachHandlers } from "./coachSocket.js"; // NEU
+import { setupCoachProfileHandlers } from "./coachProfileSocket.js"; // NEU
 import { setupAnalysisHandlers } from "./stockfishSocket.js"; // NEU
+import { setupCoachHandlers } from "./coachSocket.js"; // NEU
 
 const app = express();
 
@@ -69,8 +71,12 @@ const disconnectTimers = new Map();
 const matchmakingQueue = [];
 
 const rateBuckets = new Map();
+
 setupClanHandlers(io, { authenticatedUsers });
-setupAnalysisHandlers(io); // NEU
+setupAnalysisHandlers(io);
+setupCoachHandlers(io); // NEU
+setupCoachHandlers(io); // NEU
+setupCoachProfileHandlers(io); // NEU 
 function getBucket(socketId) {
     if (!rateBuckets.has(socketId)) {
         rateBuckets.set(socketId, { chat: [], moves: [] });
