@@ -157,17 +157,42 @@ async function runAnalysis({ socket, gameId, pgn, depth, tier }) {
     }
 
     closeEngine(engine);
-
-    // Eigene Genauigkeits-Formel (keine offizielle chess.com-Formel, aber
-    // dasselbe Prinzip: kleine Verluste kaum spürbar, große drücken schnell)
-    const accuracy = {
-        white: moveCount.w ? Math.round(accuracySum.w / moveCount.w) : 100,
-        black: moveCount.b ? Math.round(accuracySum.b / moveCount.b) : 100,
-    };
-
     const analysis = { depth, tier, moves: evaluations, accuracy, counts };
 
     await supabaseAdmin.from("games").update({ analyzed: true, analysis }).eq("id", gameId);
 
+    // NEU: Fehler für den Personal Coach in user_mistakes speichern
+    await saveMistakesForCoach({ authId: socket.data.authId, gameId, evaluations });
+
     socket.emit("analysis_complete", { gameId, analysis });
+}
+
+// NEU
+const NEGATIVE_CLASSIFICATIONS = ["blunder", "mistake", "inaccuracy", "missed_win", "slip"];
+
+function getPhase(moveNumber) {
+    if (moveNumber <= 10) return "opening";
+    if (moveNumber <= 25) return "middlegame";
+    return "endgame";
+}
+
+async function saveMistakesForCoach({ authId, gameId, evaluations }) {
+    if (!authId) return;
+
+    const rows = evaluations
+        .map((m, index) => ({ ...m, index }))
+        .filter((m) => NEGATIVE_CLASSIFICATIONS.includes(m.classification))
+        .map((m) => ({
+            user_id: authId,
+            mistake_type: m.classification,
+            phase: getPhase(m.moveNumber),
+            game_id: gameId,
+            move_index: m.index,
+            eval_loss_cp: null, // Verlust wird aktuell nicht pro Zug zurückgegeben — siehe Hinweis unten
+        }));
+
+    if (rows.length === 0) return;
+
+    const { error } = await supabaseAdmin.from("user_mistakes").insert(rows);
+    if (error) console.log("SAVE MISTAKES ERROR:", error.message);
 }
