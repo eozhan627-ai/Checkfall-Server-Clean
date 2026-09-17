@@ -184,7 +184,7 @@ async function saveMistakesForCoach({ authId, gameId, evaluations }) {
         .filter((m) => NEGATIVE_CLASSIFICATIONS.includes(m.classification))
         .map((m) => ({
             user_id: authId,
-            mistake_type: m.classification,
+            mistake_type: m.classification,//probe 
             phase: getPhase(m.moveNumber),
             game_id: gameId,
             move_index: m.index,
