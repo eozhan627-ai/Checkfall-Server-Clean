@@ -157,6 +157,12 @@ async function runAnalysis({ socket, gameId, pgn, depth, tier }) {
     }
 
     closeEngine(engine);
+
+    const accuracy = {
+        w: moveCount.w > 0 ? accuracySum.w / moveCount.w : null,
+        b: moveCount.b > 0 ? accuracySum.b / moveCount.b : null,
+    };
+
     const analysis = { depth, tier, moves: evaluations, accuracy, counts };
 
     await supabaseAdmin.from("games").update({ analyzed: true, analysis }).eq("id", gameId);
