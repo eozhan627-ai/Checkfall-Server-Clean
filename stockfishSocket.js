@@ -1,6 +1,10 @@
 import { Chess } from "chess.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
+
+
 import { createAnalysisEngine, evaluatePosition, closeEngine } from "./stockfishEngine.js";
+import { detectTacticalMotif } from "./tacticsDetector.js";
+
 
 const DEPTH_BY_TIER = { silver: 14, gold: 14, diamond: 20 };
 
