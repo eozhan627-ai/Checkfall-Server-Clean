@@ -125,8 +125,7 @@ let prevFen = startFen; // GEÄNDERT (NEU): Stellung VOR dem jeweiligen Zug, fü
   const bestMoveForThisMove = prevBestMove;
   const motif = detectTacticalMotif(Chess, prevFen, bestMoveForThisMove);
 
-        const result = await evaluatePosition(engine, fen, depth);
-        const whiteEval = toWhiteEval(result.evalCp, fen);
+        
 
         let classification = classifyMove({
             evalBeforeWhite: prevWhiteEval,
