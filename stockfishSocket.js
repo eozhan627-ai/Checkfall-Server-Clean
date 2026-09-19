@@ -98,24 +98,32 @@ async function runAnalysis({ socket, gameId, pgn, depth, tier }) {
         replay.move({ from: move.from, to: move.to, promotion: move.promotion });
         positions.push({ san: move.san, fen: replay.fen(), piece: move.piece, to: move.to });
     }
-
-    const engine = await createAnalysisEngine();
-
-    const startFen = new Chess().fen();
-    const startResult = await evaluatePosition(engine, startFen, depth);
-    let prevWhiteEval = toWhiteEval(startResult.evalCp, startFen);
-    let prevSecondWhiteEval =
-        startResult.secondEvalCp !== null ? toWhiteEval(startResult.secondEvalCp, startFen) : null;
-
-    const evaluations = [];
+const engine = await createAnalysisEngine();
+const startFen = new Chess().fen();
+const startResult = await evaluatePosition(engine, startFen, depth);
+let prevWhiteEval = toWhiteEval(startResult.evalCp, startFen);
+let prevSecondWhiteEval =
+  startResult.secondEvalCp !== null ? toWhiteEval(startResult.secondEvalCp, startFen) : null;
+let prevBestMove = startResult.bestMove; // GEÄNDERT (NEU): bester Zug für die kommende Stellung
+let prevFen = startFen; // GEÄNDERT (NEU): Stellung VOR dem jeweiligen Zug, für die Motiverkennung
+        const evaluations = [];
     const streaks = { w: 0, b: 0 };
     const counts = { w: {}, b: {} };
     const accuracySum = { w: 0, b: 0 };
     const moveCount = { w: 0, b: 0 };
 
     for (let i = 0; i < positions.length; i++) {
-        const { san, fen, piece, to } = positions[i];
-        const mover = i % 2 === 0 ? "w" : "b";
+  const { san, fen, piece, to } = positions[i];
+  const mover = i % 2 === 0 ? "w" : "b";
+
+  const result = await evaluatePosition(engine, fen, depth);
+  const whiteEval = toWhiteEval(result.evalCp, fen);
+
+  // GEÄNDERT (NEU): bestMove/prevFen gehören zur Stellung VOR diesem Zug,
+  // also aus dem vorigen Schleifendurchlauf - vorher wurde hier faelschlich
+  // der beste Zug fuer die FOLGENDE Stellung verwendet (Halbzug verschoben).
+  const bestMoveForThisMove = prevBestMove;
+  const motif = detectTacticalMotif(Chess, prevFen, bestMoveForThisMove);
 
         const result = await evaluatePosition(engine, fen, depth);
         const whiteEval = toWhiteEval(result.evalCp, fen);
@@ -144,18 +152,21 @@ async function runAnalysis({ socket, gameId, pgn, depth, tier }) {
         const clampedLoss = Math.max(0, loss);
         accuracySum[mover] += 100 * Math.exp(-clampedLoss / 150);
         moveCount[mover] += 1;
+// NACHHER
+    evaluations.push({
+      moveNumber: Math.floor(i / 2) + 1,
+      san,
+      evalCp: whiteEval,
+      bestMove: bestMoveForThisMove, // GEÄNDERT: jetzt der korrekte, um einen Halbzug korrigierte Wert
+      motif, // NEU
+      classification,
+    });
 
-        evaluations.push({
-            moveNumber: Math.floor(i / 2) + 1,
-            san,
-            evalCp: whiteEval,
-            bestMove: result.bestMove,
-            classification,
-        });
-
-        prevWhiteEval = whiteEval;
-        prevSecondWhiteEval =
-            result.secondEvalCp !== null ? toWhiteEval(result.secondEvalCp, fen) : null;
+    prevWhiteEval = whiteEval;
+    prevSecondWhiteEval =
+      result.secondEvalCp !== null ? toWhiteEval(result.secondEvalCp, fen) : null;
+    prevBestMove = result.bestMove; // NEU
+    prevFen = fen; // NEU
 
         socket.emit("analysis_progress", { gameId, progress: i + 1, total: positions.length });
     }
@@ -187,19 +198,21 @@ function getPhase(moveNumber) {
 }
 
 async function saveMistakesForCoach({ authId, gameId, evaluations }) {
-    if (!authId) return;
+  if (!authId) return;
 
-    const rows = evaluations
-        .map((m, index) => ({ ...m, index }))
-        .filter((m) => NEGATIVE_CLASSIFICATIONS.includes(m.classification))
-        .map((m) => ({
-            user_id: authId,
-            mistake_type: m.classification,//probe 
-            phase: getPhase(m.moveNumber),
-            game_id: gameId,
-            move_index: m.index,
-            eval_loss_cp: null, // Verlust wird aktuell nicht pro Zug zurückgegeben — siehe Hinweis unten
-        }));
+  const rows = evaluations
+    .map((m, index) => ({ ...m, index }))
+    .filter((m) => NEGATIVE_CLASSIFICATIONS.includes(m.classification))
+    .map((m) => ({
+      user_id: authId,
+      mistake_type: m.classification,
+      phase: getPhase(m.moveNumber),
+      game_id: gameId,
+      move_index: m.index,
+      eval_loss_cp: null, // Verlust wird aktuell nicht pro Zug zurückgegeben
+      best_move: m.bestMove ?? null, // NEU
+      motif: m.motif ? m.motif.type : null, // NEU: nur der Typ ("fork"/"pin"/"skewer"), Details bräuchten eine eigene Spalte
+    }));
 
     if (rows.length === 0) return;
 
