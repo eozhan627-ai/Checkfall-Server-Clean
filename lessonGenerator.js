@@ -2,97 +2,108 @@ import { supabaseAdmin } from "./supabaseAdmin.js";
 
 const MIN_OWN_EXAMPLES = 2;
 
-// NEU: statische Titel/Erklärungen je mistake_type (Phase + Schweregrad).
-// Ersetzt den bisherigen Platzhalter "TODO: Erklärungstext". Deckt die
-// mistake_types ab, die mistakeExtractor.js erzeugt (Phase x
-// "blunder"/"mistake" - "inaccuracy" wird dort aktuell nicht gespeichert).
-const MISTAKE_PATTERNS = {
-  opening_blunder: {
-    title: "Patzer in der Eröffnung",
+// GEÄNDERT: Schlüssel sind jetzt die tatsächlichen mistake_type-Werte aus
+// stockfishSocket.js (blunder/mistake/inaccuracy/missed_win/slip) - vorher
+// fälschlich phasenpräfigiert ("opening_blunder"), was nie traf, weil
+// mistake_type in Wirklichkeit keine Phase enthält (die steht separat in phase).
+const SEVERITY_TEXT = {
+  blunder: {
+    title: "Patzer",
     explanation:
-      "In der Eröffnung geht es vor allem um schnelle Entwicklung, Königssicherheit und Zentrumskontrolle. " +
-      "Ein Patzer hier bedeutet meist: eine taktische Erwiderung wurde übersehen, eine Figur hängt, oder eine bekannte Falle wurde nicht erkannt. " +
-      "Übe, nach jedem eigenen Zug kurz zu prüfen, ob der Gegner eine Figur gewinnen oder einen Doppelangriff starten kann, bevor du ziehst.",
+      "Ein Patzer bedeutet meist, dass eine taktische Erwiderung des Gegners übersehen wurde - " +
+      "eine Figur hängt, oder ein Gabel-/Fesselungs-/Spieß-Motiv wurde nicht gesehen.",
   },
-  opening_mistake: {
-    title: "Ungenauigkeit in der Eröffnung",
+  mistake: {
+    title: "Fehler",
     explanation:
-      "Kein Materialverlust, aber eine Abweichung von soliden Eröffnungsprinzipien - zum Beispiel ein zu früh vorgeschobener Bauer, " +
-      "vernachlässigte Entwicklung oder ein Zug ohne klaren Plan. Achte darauf, in den ersten 10-12 Zügen jede Figur nur einmal zu bewegen " +
-      "und den König rechtzeitig in Sicherheit zu bringen.",
+      "Kein sofortiger Materialverlust, aber ein spürbarer Stellungsnachteil - meist ein " +
+      "strategischer Fehlgriff oder ein zu früh erzwungener Abtausch.",
   },
-  middlegame_blunder: {
-    title: "Patzer im Mittelspiel",
+  inaccuracy: {
+    title: "Ungenauigkeit",
     explanation:
-      "Im Mittelspiel sind Patzer meist taktischer Natur: eine Gabel, ein Spieß, ein Abzugsangriff oder eine offene Linie wurden übersehen. " +
-      "Das ist der Bereich, in dem am meisten konkret gerechnet werden muss. Nimm dir vor jedem Zug bewusst Zeit, die unmittelbaren Antworten " +
-      "des Gegners auf Schach-, Schlag- und Drohzüge durchzugehen.",
+      "Eine kleine Abweichung vom besten Zug, die die Stellung noch nicht entscheidend verschlechtert, " +
+      "aber Zug für Zug Substanz kostet.",
   },
-  middlegame_mistake: {
-    title: "Ungenauigkeit im Mittelspiel",
+  missed_win: {
+    title: "Gewinn verpasst",
     explanation:
-      "Kein sofortiger Materialverlust, aber ein strategischer Fehler - ein unpassender Plan, ein zugelassenes schwaches Feld oder ein " +
-      "Abtausch zur falschen Zeit. Frag dich vor jedem Zug: Verbessert das meine schlechteste Figur oder schwächt es meine Stellung langfristig?",
+      "Die Stellung war klar gewonnen, der gespielte Zug hat den Vorteil aber deutlich verkleinert. " +
+      "Typisch dafür: zu schnell gespielt, statt die klarste Fortsetzung zu suchen.",
   },
-  endgame_blunder: {
-    title: "Patzer im Endspiel",
+  slip: {
+    title: "Ausrutscher in einer Serie guter Züge",
     explanation:
-      "Im Endspiel entscheiden oft kleine Details: Opposition, Zugzwang oder eine falsch berechnete Bauernvariante. Ein Patzer hier kostet " +
-      "meist direkt die Partie, weil es kaum noch Ausgleichschancen gibt. Übe Grundtechniken wie Königsopposition und einfache Turmendspiele, " +
-      "bis sie automatisch sitzen.",
-  },
-  endgame_mistake: {
-    title: "Ungenauigkeit im Endspiel",
-    explanation:
-      "Keine sofortige Katastrophe, aber suboptimale Technik - zum Beispiel ein zu passiver König oder eine ungünstig gewählte Bauernstruktur. " +
-      "Im Endspiel ist der König eine aktive Figur: Bring ihn frühzeitig ins Zentrum, sobald die Damen vom Brett sind.",
+      "Nach mehreren starken Zügen in Folge kommt hier eine kleine Ungenauigkeit - oft ein " +
+      "Konzentrationsabfall, wenn die Stellung schon gut aussieht.",
   },
 };
 
-const FALLBACK_PATTERN = {
-  title: "Wiederkehrender Fehler",
-  explanation:
-    "Dieser Fehlertyp ist bei dir häufiger aufgetreten. Schau dir die Beispielstellungen unten genau an und versuche, das gemeinsame Muster zu erkennen.",
+const MOTIF_TEXT = {
+  fork: "Der verpasste Zug hätte eine Gabel ausgenutzt - eine Figur hätte gleichzeitig zwei gegnerische Ziele angegriffen.",
+  pin: "Der verpasste Zug hätte eine Fesselung ausgenutzt - eine gegnerische Figur konnte sich nicht bewegen, ohne eine wertvollere Figur (oder den König) dahinter preiszugeben.",
+  skewer: "Der verpasste Zug hätte einen Spieß ausgenutzt - die wertvollere gegnerische Figur stand vorne und musste ausweichen, wodurch die Figur dahinter angreifbar wurde.",
 };
 
-async function selectPositions(userId, mistakeType) {
-  const { data: ownMistakes } = await supabaseAdmin
+const PHASE_LABEL = { opening: "in der Eröffnung", middlegame: "im Mittelspiel", endgame: "im Endspiel" };
+
+function dominantPhase(rows) {
+  const counts = {};
+  for (const r of rows) counts[r.phase] = (counts[r.phase] || 0) + 1;
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+}
+
+async function selectMistakeRows(userId, mistakeType) {
+  const { data } = await supabaseAdmin
     .from("user_mistakes")
-    .select("game_id, move_index")
+    .select("game_id, move_index, phase, motif")
     .eq("user_id", userId)
     .eq("mistake_type", mistakeType)
-    .limit(3);
+    .limit(20); // genug für eine verlässliche Phasen-/Motiv-Auswertung
 
-  const ownExamples = (ownMistakes || []).map((m) => ({
-    source: "own",
-    gameId: m.game_id,
-    moveIndex: m.move_index,
-  }));
-
-  if (ownExamples.length >= MIN_OWN_EXAMPLES) return ownExamples;
-
-  const { data: generic } = await supabaseAdmin
-    .from("generic_positions")
-    .select("fen, solution, comment")
-    .eq("mistake_type", mistakeType)
-    .limit(3 - ownExamples.length);
-
-  return [...ownExamples, ...(generic || []).map((g) => ({ source: "generic", ...g }))];
+  return data || [];
 }
 
 export async function generateLesson(userId, mistakeType) {
-  const examples = await selectPositions(userId, mistakeType);
+  const rows = await selectMistakeRows(userId, mistakeType);
+  const severity = SEVERITY_TEXT[mistakeType];
 
-  // GEÄNDERT: Titel/Erklärung kommen jetzt aus MISTAKE_PATTERNS statt aus
-  // dem TODO-Platzhalter. Fällt auf einen generischen Text zurück, falls
-  // mistakeType (noch) nicht in der Map steht.
-  const pattern = MISTAKE_PATTERNS[mistakeType] || FALLBACK_PATTERN;
+  if (!severity) {
+    throw new Error(`UNKNOWN_MISTAKE_TYPE: ${mistakeType}`);
+  }
+
+  const phase = dominantPhase(rows);
+  const motifCounts = {};
+  for (const r of rows) if (r.motif) motifCounts[r.motif] = (motifCounts[r.motif] || 0) + 1;
+  const dominantMotif = Object.entries(motifCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+
+  let explanation = severity.explanation;
+  if (phase) {
+    explanation += ` Bei dir passiert das am häufigsten ${PHASE_LABEL[phase] ?? phase}.`;
+  }
+  if (dominantMotif && MOTIF_TEXT[dominantMotif]) {
+    explanation += ` ${MOTIF_TEXT[dominantMotif]}`;
+  }
+
+  const ownExamples = rows
+    .slice(0, 3)
+    .map((r) => ({ source: "own", gameId: r.game_id, moveIndex: r.move_index, motif: r.motif }));
+
+  let examples = ownExamples;
+  if (examples.length < MIN_OWN_EXAMPLES) {
+    const { data: generic } = await supabaseAdmin
+      .from("generic_positions")
+      .select("fen, solution, comment")
+      .eq("mistake_type", mistakeType)
+      .limit(3 - examples.length);
+    examples = [...examples, ...(generic || []).map((g) => ({ source: "generic", ...g }))];
+  }
 
   const lesson = {
     user_id: userId,
     mistake_type: mistakeType,
-    title: pattern.title,
-    explanation: pattern.explanation,
+    title: severity.title,
+    explanation,
     example_fens: examples,
   };
 
