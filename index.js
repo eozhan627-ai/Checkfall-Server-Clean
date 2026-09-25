@@ -99,6 +99,17 @@ function allowAction(socketId, kind, maxCount, windowMs) {
 }
 
 // =============================
+// ONLINE COUNT
+// =============================
+// Echte Anzahl aktuell verbundener Sockets (nicht nur eingeloggte User,
+// damit auch Gäste/nicht-authentifizierte Verbindungen mitgezählt werden).
+// io.engine.clientsCount wird von Socket.IO selbst hochgezählt/runtergezählt,
+// ist also immer korrekt, ohne dass wir selbst mitzählen müssen.
+function broadcastOnlineCount() {
+    io.emit("online_count", { count: io.engine.clientsCount });
+}
+
+// =============================
 // SMALL VALIDATION HELPERS
 // =============================
 
@@ -369,6 +380,13 @@ setInterval(() => {
         });
     }
 }, 1000);
+
+// Regelmäßiger Broadcast der Online-Zahl, damit sie auch ohne Verbindungs-
+// wechsel (z.B. Reconnects, die clientsCount nicht sofort ändern) aktuell
+// bleibt. Alle 10s ist unauffällig genug, um keine Last zu erzeugen.
+setInterval(() => {
+    broadcastOnlineCount();
+}, 10_000);
 
 
 
@@ -730,6 +748,17 @@ app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
 
 io.on("connection", (socket) => {
     console.log("Connected:", socket.id);
+
+    // NEU: allen Clients die aktualisierte Online-Zahl schicken, sobald
+    // jemand Neues verbunden ist.
+    broadcastOnlineCount();
+
+    // NEU: erlaubt es dem Client, die aktuelle Zahl sofort beim Laden
+    // der Startseite abzufragen, statt auf den nächsten periodischen
+    // Broadcast zu warten.
+    socket.on("get_online_count", () => {
+        socket.emit("online_count", { count: io.engine.clientsCount });
+    });
 
     socket.on("authenticate_socket", (data) => {
         const authId = data?.authId;
@@ -1122,6 +1151,10 @@ io.on("connection", (socket) => {
 
     socket.on("disconnect", () => {
         console.log("Disconnected:", socket.id);
+
+        // NEU: allen verbliebenen Clients die aktualisierte Online-Zahl
+        // schicken, sobald jemand die Verbindung trennt.
+        broadcastOnlineCount();
 
         const authId = socket.data.authId;
 
