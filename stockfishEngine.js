@@ -16,6 +16,9 @@ const ENGINE_HASH_MB = Number(process.env.STOCKFISH_HASH_MB) || 32;
 // starten gleichzeitig) der uciok/readyok-Handshake einfach länger dauern
 // kann, ohne dass etwas kaputt ist.
 const ENGINE_INIT_TIMEOUT_MS = Number(process.env.STOCKFISH_INIT_TIMEOUT_MS) || 15000;
+// NEU: harte Zeit-Obergrenze pro Zug, als Sicherheitsnetz gegen ausufernde
+// Suchzeiten bei Tiefe 20 auf schwacher/überlasteter CPU.
+const ENGINE_MAX_MOVE_TIME_MS = Number(process.env.STOCKFISH_MAX_MOVE_TIME_MS) || 3000;
 
 export function createAnalysisEngine() {
     return new Promise((resolve, reject) => {
@@ -110,7 +113,14 @@ export function evaluatePosition(engine, fen, depth) {
         engine.stdout.on("data", onData);
 
         engine.stdin.write(`position fen ${fen}\n`);
-        engine.stdin.write(`go depth ${depth}\n`);
+        // NEU: movetime als harte Obergrenze zusätzlich zur Tiefe.
+        // Falls Tiefe X auf dieser Maschine ungewöhnlich lange braucht
+        // (langsame CPU, schlecht optimiertes Binary, o.ä.), bricht die
+        // Suche trotzdem nach spätestens ENGINE_MAX_MOVE_TIME_MS ab, statt
+        // dass ein einzelner Zug die gesamte Analyse in die Länge zieht.
+        // "go depth X movetime Y" -> Stockfish stoppt, sobald die ERSTE
+        // der beiden Grenzen erreicht ist.
+        engine.stdin.write(`go depth ${depth} movetime ${ENGINE_MAX_MOVE_TIME_MS}\n`);
     });
 }
 
