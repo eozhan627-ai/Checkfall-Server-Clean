@@ -3,11 +3,19 @@ import os from "os";
 
 const STOCKFISH_PATH = "/usr/games/stockfish";
 
-// GEÄNDERT: Threads/Hash konfigurierbar, Default sinnvoll gewählt.
-// Ohne diese Optionen läuft Stockfish mit 1 Thread und 16MB Hash -
-// das macht JEDE einzelne Suche unnötig langsam, unabhängig von Parallelisierung.
-const ENGINE_THREADS = Number(process.env.STOCKFISH_THREADS) || 2;
-const ENGINE_HASH_MB = Number(process.env.STOCKFISH_HASH_MB) || 128;
+// GEÄNDERT: Threads/Hash konfigurierbar, Defaults bewusst NIEDRIG gewählt.
+// Ohne diese Optionen läuft Stockfish mit 1 Thread und 16MB Hash - das
+// macht jede einzelne Suche langsam. Aber: zu hohe Werte (z.B. Threads=2
+// pro Engine bei 6 parallelen Engines = 12 angeforderte Threads) überlasten
+// auf kleinen Hosting-Plänen (Render etc.) die CPU beim gleichzeitigen
+// Start, was zu STOCKFISH_INIT_TIMEOUT führt. Lieber konservativ starten
+// und über die Env-Variablen gezielt an den tatsächlichen Plan anpassen.
+const ENGINE_THREADS = Number(process.env.STOCKFISH_THREADS) || 1;
+const ENGINE_HASH_MB = Number(process.env.STOCKFISH_HASH_MB) || 32;
+// NEU: Timeout großzügiger, weil unter CPU-Last (z.B. mehrere Engines
+// starten gleichzeitig) der uciok/readyok-Handshake einfach länger dauern
+// kann, ohne dass etwas kaputt ist.
+const ENGINE_INIT_TIMEOUT_MS = Number(process.env.STOCKFISH_INIT_TIMEOUT_MS) || 15000;
 
 export function createAnalysisEngine() {
     return new Promise((resolve, reject) => {
@@ -19,9 +27,10 @@ export function createAnalysisEngine() {
         const timeout = setTimeout(() => {
             if (!settled) {
                 settled = true;
+                engine.kill(); // NEU: hängenden Prozess nicht als Zombie zurücklassen
                 reject(new Error("STOCKFISH_INIT_TIMEOUT"));
             }
-        }, 5000);
+        }, ENGINE_INIT_TIMEOUT_MS);
 
         engine.on("error", (err) => {
             if (!settled) {
@@ -114,15 +123,46 @@ export function closeEngine(engine) {
     }
 }
 
-// NEU: Pool aus mehreren Engine-Prozessen für parallele Analyse.
-// Größe defaultmäßig an CPU-Kerne gekoppelt (minus 1, damit der Rechner
-// nicht komplett dicht ist), aber gedeckelt, weil jede Engine-Instanz
-// selbst schon ENGINE_THREADS Kerne beansprucht.
+// GEÄNDERT: Poolgröße NICHT mehr von os.cpus() ableiten. Auf Render/in
+// Containern liefert os.cpus() oft die Kernzahl der Host-Maschine, nicht
+// das tatsächliche CPU-Kontingent des Containers - das führte dazu, dass
+// der Pool viel zu groß gewählt wurde (z.B. 6 Engines à 2 Threads auf
+// einem 0.5-vCPU-Plan) und die Engines sich beim Start gegenseitig die
+// CPU wegnahmen -> STOCKFISH_INIT_TIMEOUT. Fester, konfigurierbarer
+// Default stattdessen - an den tatsächlichen Hosting-Plan anpassen.
+const DEFAULT_POOL_SIZE = Number(process.env.STOCKFISH_POOL_SIZE) || 2;
+
 export async function createEnginePool(size) {
-    const poolSize = size || Math.max(1, Math.min(6, os.cpus().length - 1));
-    const engines = await Promise.all(
-        Array.from({ length: poolSize }, () => createAnalysisEngine())
-    );
+    const poolSize = size || DEFAULT_POOL_SIZE;
+
+    // NEU: Engines leicht gestaffelt starten statt alle im selben Tick.
+    // Das entzerrt die CPU-Spitze beim uci-Handshake, die auf kleinen
+    // Instanzen sonst mehrere Engines gleichzeitig ausbremst.
+    const settled = [];
+    for (let i = 0; i < poolSize; i++) {
+        settled.push(
+            createAnalysisEngine()
+                .then((engine) => ({ status: "fulfilled", value: engine }))
+                .catch((error) => ({ status: "rejected", reason: error }))
+        );
+        if (i < poolSize - 1) await new Promise((r) => setTimeout(r, 250));
+    }
+    const results = await Promise.all(settled);
+
+    const engines = results.filter((r) => r.status === "fulfilled").map((r) => r.value);
+    const failures = results.filter((r) => r.status === "rejected");
+
+    if (failures.length > 0) {
+        console.log(`ENGINE POOL: ${failures.length}/${poolSize} Engine(s) beim Start fehlgeschlagen`);
+    }
+
+    // NEU: Nicht alles abbrechen, nur weil EINE Engine nicht rechtzeitig
+    // hochkam - mit den übrigen weiterarbeiten. Nur wenn wirklich keine
+    // einzige Engine bereit ist, ist die Analyse tatsächlich unmöglich.
+    if (engines.length === 0) {
+        throw new Error("STOCKFISH_POOL_INIT_FAILED");
+    }
+
     return engines;
 }
 
