@@ -1,10 +1,12 @@
 import { Chess } from "chess.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
 
-
-import { createAnalysisEngine, evaluatePosition, closeEngine } from "./stockfishEngine.js";
+import {
+    createEnginePool,
+    closeEnginePool,
+    evaluatePositionsInParallel,
+} from "./stockfishEngine.js";
 import { detectTacticalMotif } from "./tacticsDetector.js";
-
 
 const DEPTH_BY_TIER = { silver: 14, gold: 14, diamond: 20 };
 
@@ -98,34 +100,53 @@ async function runAnalysis({ socket, gameId, pgn, depth, tier }) {
         replay.move({ from: move.from, to: move.to, promotion: move.promotion });
         positions.push({ san: move.san, fen: replay.fen(), piece: move.piece, to: move.to });
     }
-const engine = await createAnalysisEngine();
-const startFen = new Chess().fen();
-const startResult = await evaluatePosition(engine, startFen, depth);
-let prevWhiteEval = toWhiteEval(startResult.evalCp, startFen);
-let prevSecondWhiteEval =
-  startResult.secondEvalCp !== null ? toWhiteEval(startResult.secondEvalCp, startFen) : null;
-let prevBestMove = startResult.bestMove; // GEÄNDERT (NEU): bester Zug für die kommende Stellung
-let prevFen = startFen; // GEÄNDERT (NEU): Stellung VOR dem jeweiligen Zug, für die Motiverkennung
-        const evaluations = [];
+
+    const startFen = new Chess().fen();
+
+    // GEÄNDERT: Statt jede Stellung einzeln nacheinander mit EINER Engine
+    // abzuwarten, werden alle Stellungen (Start + jeder Zug) vorab gesammelt
+    // und auf einen Pool paralleler Engines verteilt. Die Bewertung einer
+    // Stellung hängt nicht von der vorherigen ab (jede Suche startet frisch),
+    // deshalb ist das ohne Verhaltensänderung parallelisierbar.
+    const allFens = [startFen, ...positions.map((p) => p.fen)];
+    const tasks = allFens.map((fen) => ({ fen, depth }));
+
+    const engines = await createEnginePool();
+    let results;
+    try {
+        results = await evaluatePositionsInParallel(engines, tasks, (done, total) => {
+            // Fortschritt bezieht sich auf ausgewertete Stellungen, nicht auf Züge -
+            // total ist Züge + 1 (Startstellung), daher leicht verschoben, aber
+            // für eine Fortschrittsanzeige irrelevant.
+            socket.emit("analysis_progress", { gameId, progress: Math.min(done, positions.length), total: positions.length });
+        });
+    } finally {
+        closeEnginePool(engines);
+    }
+
+    // Ab hier: reine Nachbearbeitung ohne weitere Engine-Calls, wie vorher -
+    // nur dass die Daten jetzt bereits vollständig (parallel) vorliegen.
+    const startResult = results[0];
+    let prevWhiteEval = toWhiteEval(startResult.evalCp, startFen);
+    let prevSecondWhiteEval =
+        startResult.secondEvalCp !== null ? toWhiteEval(startResult.secondEvalCp, startFen) : null;
+    let prevBestMove = startResult.bestMove;
+    let prevFen = startFen;
+
+    const evaluations = [];
     const streaks = { w: 0, b: 0 };
     const counts = { w: {}, b: {} };
     const accuracySum = { w: 0, b: 0 };
     const moveCount = { w: 0, b: 0 };
 
     for (let i = 0; i < positions.length; i++) {
-  const { san, fen, piece, to } = positions[i];
-  const mover = i % 2 === 0 ? "w" : "b";
+        const { san, fen, piece, to } = positions[i];
+        const mover = i % 2 === 0 ? "w" : "b";
+        const result = results[i + 1];
+        const whiteEval = toWhiteEval(result.evalCp, fen);
 
-  const result = await evaluatePosition(engine, fen, depth);
-  const whiteEval = toWhiteEval(result.evalCp, fen);
-
-  // GEÄNDERT (NEU): bestMove/prevFen gehören zur Stellung VOR diesem Zug,
-  // also aus dem vorigen Schleifendurchlauf - vorher wurde hier faelschlich
-  // der beste Zug fuer die FOLGENDE Stellung verwendet (Halbzug verschoben).
-  const bestMoveForThisMove = prevBestMove;
-  const motif = detectTacticalMotif(Chess, prevFen, bestMoveForThisMove);
-
-        
+        const bestMoveForThisMove = prevBestMove;
+        const motif = detectTacticalMotif(Chess, prevFen, bestMoveForThisMove);
 
         let classification = classifyMove({
             evalBeforeWhite: prevWhiteEval,
@@ -151,26 +172,21 @@ let prevFen = startFen; // GEÄNDERT (NEU): Stellung VOR dem jeweiligen Zug, fü
         const clampedLoss = Math.max(0, loss);
         accuracySum[mover] += 100 * Math.exp(-clampedLoss / 150);
         moveCount[mover] += 1;
-// NACHHER
-    evaluations.push({
-      moveNumber: Math.floor(i / 2) + 1,
-      san,
-      evalCp: whiteEval,
-      bestMove: bestMoveForThisMove, // GEÄNDERT: jetzt der korrekte, um einen Halbzug korrigierte Wert
-      motif, // NEU
-      classification,
-    });
 
-    prevWhiteEval = whiteEval;
-    prevSecondWhiteEval =
-      result.secondEvalCp !== null ? toWhiteEval(result.secondEvalCp, fen) : null;
-    prevBestMove = result.bestMove; // NEU
-    prevFen = fen; // NEU
+        evaluations.push({
+            moveNumber: Math.floor(i / 2) + 1,
+            san,
+            evalCp: whiteEval,
+            bestMove: bestMoveForThisMove,
+            motif,
+            classification,
+        });
 
-        socket.emit("analysis_progress", { gameId, progress: i + 1, total: positions.length });
+        prevWhiteEval = whiteEval;
+        prevSecondWhiteEval = result.secondEvalCp !== null ? toWhiteEval(result.secondEvalCp, fen) : null;
+        prevBestMove = result.bestMove;
+        prevFen = fen;
     }
-
-    closeEngine(engine);
 
     const accuracy = {
         w: moveCount.w > 0 ? accuracySum.w / moveCount.w : null,
@@ -181,13 +197,11 @@ let prevFen = startFen; // GEÄNDERT (NEU): Stellung VOR dem jeweiligen Zug, fü
 
     await supabaseAdmin.from("games").update({ analyzed: true, analysis }).eq("id", gameId);
 
-    // NEU: Fehler für den Personal Coach in user_mistakes speichern
     await saveMistakesForCoach({ authId: socket.data.authId, gameId, evaluations });
 
     socket.emit("analysis_complete", { gameId, analysis });
 }
 
-// NEU
 const NEGATIVE_CLASSIFICATIONS = ["blunder", "mistake", "inaccuracy", "missed_win", "slip"];
 
 function getPhase(moveNumber) {
@@ -197,21 +211,21 @@ function getPhase(moveNumber) {
 }
 
 async function saveMistakesForCoach({ authId, gameId, evaluations }) {
-  if (!authId) return;
+    if (!authId) return;
 
-  const rows = evaluations
-    .map((m, index) => ({ ...m, index }))
-    .filter((m) => NEGATIVE_CLASSIFICATIONS.includes(m.classification))
-    .map((m) => ({
-      user_id: authId,
-      mistake_type: m.classification,
-      phase: getPhase(m.moveNumber),
-      game_id: gameId,
-      move_index: m.index,
-      eval_loss_cp: null, // Verlust wird aktuell nicht pro Zug zurückgegeben
-      best_move: m.bestMove ?? null, // NEU
-      motif: m.motif ? m.motif.type : null, // NEU: nur der Typ ("fork"/"pin"/"skewer"), Details bräuchten eine eigene Spalte
-    }));
+    const rows = evaluations
+        .map((m, index) => ({ ...m, index }))
+        .filter((m) => NEGATIVE_CLASSIFICATIONS.includes(m.classification))
+        .map((m) => ({
+            user_id: authId,
+            mistake_type: m.classification,
+            phase: getPhase(m.moveNumber),
+            game_id: gameId,
+            move_index: m.index,
+            eval_loss_cp: null,
+            best_move: m.bestMove ?? null,
+            motif: m.motif ? m.motif.type : null,
+        }));
 
     if (rows.length === 0) return;
 
