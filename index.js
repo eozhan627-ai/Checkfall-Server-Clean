@@ -27,6 +27,10 @@ const RECONNECT_GRACE_MS = 25_000;
 const MAX_CHAT_MESSAGES_PER_10S = 8;
 const MAX_MOVES_PER_2S = 12;
 
+// NEU: wie lange nach Partieende eine Revanche noch möglich ist, bevor der
+// Snapshot (Namen/Ratings/authIds) wieder verworfen wird.
+const REMATCH_WINDOW_MS = 10 * 60 * 1000;
+
 app.use(express.json({ limit: "1mb" }));
 
 const upload = multer({
@@ -72,6 +76,11 @@ const disconnectTimers = new Map();
 const matchmakingQueue = [];
 
 const rateBuckets = new Map();
+
+// NEU: Snapshot von gerade beendeten PvP-Partien (roomId -> Daten), damit
+// eine Revanche mit denselben Spielern (Farben getauscht) möglich ist, auch
+// nachdem cleanupRoom() das eigentliche Spiel schon gelöscht hat.
+const finishedGames = new Map();
 
 setupClanHandlers(io, { authenticatedUsers });
 setupAnalysisHandlers(io);
@@ -167,6 +176,10 @@ function createPvPGame() {
         players: { w: null, b: null },
         authIds: { w: null, b: null },
         ratings: { w: 1000, b: 1000 },
+        // NEU: werden nur zum Zeitpunkt des game_start gesetzt und für eine
+        // mögliche Revanche gebraucht (sonst nirgends dauerhaft gespeichert).
+        names: { w: null, b: null },
+        avatars: { w: null, b: null },
     };
 }
 
@@ -388,6 +401,16 @@ setInterval(() => {
     broadcastOnlineCount();
 }, 10_000);
 
+// NEU: alte Revanche-Snapshots wieder aufräumen, falls niemand mehr reagiert.
+setInterval(() => {
+    const now = Date.now();
+    for (const [roomId, info] of finishedGames.entries()) {
+        if (now - info.endedAt > REMATCH_WINDOW_MS) {
+            finishedGames.delete(roomId);
+        }
+    }
+}, 60_000);
+
 
 
 // =============================
@@ -395,6 +418,21 @@ setInterval(() => {
 // =============================
 
 function cleanupRoom(roomId) {
+    const g = games.get(roomId);
+
+    if (g) {
+        // NEU: Snapshot für eine mögliche Revanche aufheben - Namen/Ratings/
+        // authIds gehen sonst verloren, weil sie nur im Game-Objekt lagen.
+        finishedGames.set(roomId, {
+            players: { ...g.players },
+            authIds: { ...g.authIds },
+            ratings: { ...g.ratings },
+            names: { ...g.names },
+            avatars: { ...g.avatars },
+            endedAt: Date.now(),
+        });
+    }
+
     games.delete(roomId);
 
     const bot = botGames.get(roomId);
@@ -607,6 +645,10 @@ function startPvPGame(playerA, playerB) {
     game.authIds.b = black.authId;
     game.ratings.w = white.rating;
     game.ratings.b = black.rating;
+    game.names.w = white.name;
+    game.names.b = black.name;
+    game.avatars.w = white.avatar;
+    game.avatars.b = black.avatar;
 
     games.set(roomId, game);
 
@@ -1132,6 +1174,8 @@ io.on("connection", (socket) => {
         });
     });
 
+    // GEÄNDERT: eine Revanche startet jetzt tatsächlich eine neue Partie
+    // mit denselben beiden Spielern, Farben getauscht.
     socket.on("rematch_request", ({ roomId }) => {
         if (!isNonEmptyString(roomId, 200)) return;
 
@@ -1142,11 +1186,85 @@ io.on("connection", (socket) => {
     socket.on("rematch_answer", ({ roomId, accept }) => {
         if (!isNonEmptyString(roomId, 200)) return;
 
-        if (accept) {
-            socket.to(roomId).emit("rematch_accepted");
-        } else {
+        if (!accept) {
             socket.to(roomId).emit("rematch_declined");
+            return;
         }
+
+        const info = finishedGames.get(roomId);
+
+        if (!info) {
+            io.to(roomId).emit("rematch_error", {
+                message: "Die Revanche ist nicht mehr möglich.",
+            });
+            return;
+        }
+
+        const oldWhiteId = info.players.w;
+        const oldBlackId = info.players.b;
+
+        const oldWhiteSocket = oldWhiteId ? io.sockets.sockets.get(oldWhiteId) : null;
+        const oldBlackSocket = oldBlackId ? io.sockets.sockets.get(oldBlackId) : null;
+
+        if (!oldWhiteSocket || !oldBlackSocket) {
+            io.to(roomId).emit("rematch_error", {
+                message: "Dein Gegner ist nicht mehr online.",
+            });
+            return;
+        }
+
+        finishedGames.delete(roomId);
+
+        // Farben tauschen: wer eben Schwarz war, spielt jetzt Weiß und
+        // umgekehrt - deshalb w/b bewusst vertauscht befüllt.
+        const newRoomId = `${crypto.randomUUID()}`;
+        const newGame = createPvPGame();
+
+        newGame.players.w = oldBlackId;
+        newGame.players.b = oldWhiteId;
+        newGame.authIds.w = info.authIds.b;
+        newGame.authIds.b = info.authIds.w;
+        newGame.ratings.w = info.ratings.b;
+        newGame.ratings.b = info.ratings.w;
+        newGame.names.w = info.names.b;
+        newGame.names.b = info.names.w;
+        newGame.avatars.w = info.avatars.b;
+        newGame.avatars.b = info.avatars.w;
+
+        oldWhiteSocket.join(newRoomId);
+        oldBlackSocket.join(newRoomId);
+
+        games.set(newRoomId, newGame);
+
+        socketToRoom.set(oldWhiteId, newRoomId);
+        socketToRoom.set(oldBlackId, newRoomId);
+
+        if (newGame.authIds.w) authIdToRoom.set(newGame.authIds.w, newRoomId);
+        if (newGame.authIds.b) authIdToRoom.set(newGame.authIds.b, newRoomId);
+
+        io.to(newRoomId).emit("game_start", {
+            roomId: newRoomId,
+            white: newGame.players.w,
+            black: newGame.players.b,
+            whiteName: newGame.names.w,
+            blackName: newGame.names.b,
+            whiteAvatar: newGame.avatars.w,
+            blackAvatar: newGame.avatars.b,
+            whiteRating: newGame.ratings.w,
+            blackRating: newGame.ratings.b,
+            whiteAuthId: newGame.authIds.w,
+            blackAuthId: newGame.authIds.b,
+            whiteTime: newGame.whiteTime,
+            blackTime: newGame.blackTime,
+            increment: newGame.increment,
+        });
+
+        console.log("REMATCH STARTED:", {
+            oldRoomId: roomId,
+            newRoomId,
+            white: newGame.names.w,
+            black: newGame.names.b,
+        });
     });
 
     socket.on("disconnect", () => {
