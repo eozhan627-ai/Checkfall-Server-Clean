@@ -662,6 +662,7 @@ function startPvPGame(playerA, playerB) {
         roomId,
         white: white.id,
         black: black.id,
+        fen: game.game.fen(), // FIX: fehlte bisher - new Chess("startpos") im Client crasht sonst
         whiteName: white.name,
         blackName: black.name,
         whiteAvatar: white.avatar,
@@ -1246,6 +1247,7 @@ io.on("connection", (socket) => {
             roomId: newRoomId,
             white: newGame.players.w,
             black: newGame.players.b,
+            fen: newGame.game.fen(), // FIX: ohne fen crasht new Chess("startpos") im Client
             whiteName: newGame.names.w,
             blackName: newGame.names.b,
             whiteAvatar: newGame.avatars.w,
