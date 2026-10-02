@@ -79,6 +79,8 @@ const BADGE_COLORS = ["#5B8DB8", "#D4AF37", "#6FBF73", "#D9534F", "#9B7FD1", "#E
 
 // Postgres/PostgREST codes for "this column or table does not exist" - the
 // database script for the clan upgrade has not been run yet.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function isMissingSchema(error) {
     return ["42703", "42P01", "PGRST204", "PGRST205", "PGRST200"].includes(error?.code);
 }
@@ -707,6 +709,63 @@ export function setupClanHandlers(io, { authenticatedUsers, authIdToRoom }) {
                 return {
                     online: ids.filter(isOnline),
                     inGame: ids.filter(isInGame),
+                };
+            })
+        );
+
+        // =============================
+        // PLAYER CARD (profile of another player)
+        // =============================
+        // Public information only: name, avatar, rating, statistics, clan
+        // and whether the player is online. No account needed to look.
+        socket.on(
+            "get_player_profile",
+            safeHandler(async ({ userId }) => {
+                if (!isNonEmptyString(userId, 64) || !UUID_PATTERN.test(userId)) {
+                    throw new Error("PLAYER_NOT_FOUND");
+                }
+
+                let { data: profile, error } = await supabaseAdmin
+                    .from("profiles")
+                    .select("id, username, avatar, rating, games_played, wins, puzzles_solved, vip_tier, last_seen_at")
+                    .eq("id", userId)
+                    .maybeSingle();
+
+                if (error && isMissingSchema(error)) {
+                    ({ data: profile } = await supabaseAdmin
+                        .from("profiles")
+                        .select("id, username, avatar, rating, vip_tier")
+                        .eq("id", userId)
+                        .maybeSingle());
+                }
+
+                if (!profile) throw new Error("PLAYER_NOT_FOUND");
+
+                const { data: membership } = await supabaseAdmin
+                    .from("clan_members")
+                    .select("clan_id, rank")
+                    .eq("user_id", userId)
+                    .maybeSingle();
+
+                const clan = membership ? await loadClan(membership.clan_id) : null;
+                const online = isOnline(userId);
+
+                return {
+                    profile: {
+                        id: profile.id,
+                        username: profile.username,
+                        avatar: profile.avatar || "",
+                        rating: Number.isFinite(profile.rating) ? profile.rating : 1000,
+                        games_played: profile.games_played ?? 0,
+                        wins: profile.wins ?? 0,
+                        puzzles_solved: profile.puzzles_solved ?? 0,
+                        vip_tier: profile.vip_tier || "none",
+                        last_seen_at: profile.last_seen_at ?? null,
+                    },
+                    clan,
+                    clanRank: clan ? membership.rank : null,
+                    online,
+                    inGame: online ? isInGame(userId) : false,
                 };
             })
         );

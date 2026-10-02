@@ -246,12 +246,39 @@ function normalizeMovePayload(rawMove) {
 // GAME FACTORIES
 // =============================
 
-function createPvPGame() {
+// Time controls a player can choose: "minutes+increment in seconds".
+// The app shows the same list (lib/timeControls.ts).
+const TIME_CONTROLS = {
+    "1+0": { baseMs: 60_000, incrementMs: 0 },
+    "2+1": { baseMs: 120_000, incrementMs: 1000 },
+    "3+0": { baseMs: 180_000, incrementMs: 0 },
+    "3+2": { baseMs: 180_000, incrementMs: 2000 },
+    "5+0": { baseMs: 300_000, incrementMs: 0 },
+    "5+2": { baseMs: 300_000, incrementMs: 2000 },
+    "10+0": { baseMs: 600_000, incrementMs: 0 },
+    "10+5": { baseMs: 600_000, incrementMs: 5000 },
+    "15+10": { baseMs: 900_000, incrementMs: 10_000 },
+    "30+0": { baseMs: 1_800_000, incrementMs: 0 },
+};
+// What older app versions (which do not send a time control) play.
+const DEFAULT_TIME_CONTROL = "5+2";
+
+function resolveTimeControl(value) {
+    return typeof value === "string" && Object.hasOwn(TIME_CONTROLS, value)
+        ? value
+        : DEFAULT_TIME_CONTROL;
+}
+
+function createPvPGame(timeControl = DEFAULT_TIME_CONTROL) {
+    const id = resolveTimeControl(timeControl);
+    const { baseMs, incrementMs } = TIME_CONTROLS[id];
+
     return {
         game: new Chess(),
-        whiteTime: 300000,
-        blackTime: 300000,
-        increment: 2000,
+        timeControl: id,
+        whiteTime: baseMs,
+        blackTime: baseMs,
+        increment: incrementMs,
         activeColor: "w",
         lastTick: Date.now(),
         paused: false,
@@ -388,6 +415,9 @@ function findMatchForPlayer(player) {
         const opponent = matchmakingQueue[i];
 
         if (opponent.id === player.id) continue;
+
+        // Only players who want the same time control are paired.
+        if (resolveTimeControl(opponent.timeControl) !== resolveTimeControl(player.timeControl)) continue;
 
         const opponentSocket = io.sockets.sockets.get(opponent.id);
 
@@ -612,6 +642,7 @@ function cleanupRoom(roomId) {
             names: { ...g.names },
             avatars: { ...g.avatars },
             friendly: Boolean(g.friendly),
+            timeControl: g.timeControl,
             endedAt: Date.now(),
         });
     }
@@ -808,7 +839,7 @@ function startPvPGame(playerA, playerB, options = {}) {
     io.sockets.sockets.get(playerA.id)?.join(roomId);
     io.sockets.sockets.get(playerB.id)?.join(roomId);
 
-    const game = createPvPGame();
+    const game = createPvPGame(options.timeControl ?? playerA.timeControl);
     game.friendly = Boolean(options.friendly);
 
     const white = playerA.joinedAt <= playerB.joinedAt ? playerA : playerB;
@@ -849,6 +880,7 @@ function startPvPGame(playerA, playerB, options = {}) {
         whiteTime: game.whiteTime,
         blackTime: game.blackTime,
         increment: game.increment,
+        timeControl: game.timeControl,
         friendly: game.friendly,
         // Set for games that started from a challenge: the app opens the
         // board from whatever screen the players are on.
@@ -1296,19 +1328,33 @@ io.on("connection", (socket) => {
 
             const challengeId = crypto.randomUUID();
 
+            // Game settings chosen by the challenger.
+            const timeControl = resolveTimeControl(data?.timeControl);
+            const rated = data?.rated === true;
+            // In a rated game the colours are always drawn, so nobody can
+            // pick White for themselves in every game.
+            const color = !rated && (data?.color === "w" || data?.color === "b") ? data.color : "random";
+
             challenges.set(challengeId, {
                 from: authId,
                 to: target,
+                timeControl,
+                rated,
+                color,
                 timeout: setTimeout(() => closeChallenge(challengeId, "challenge_expired"), CHALLENGE_TTL_MS),
             });
 
             targetSocket.emit("challenge_received", {
                 challengeId,
                 from,
+                timeControl,
+                rated,
+                // The colour the challenged player would get.
+                color: color === "random" ? "random" : color === "w" ? "b" : "w",
                 expiresInMs: CHALLENGE_TTL_MS,
             });
 
-            reply({ ok: true, challengeId, expiresInMs: CHALLENGE_TTL_MS });
+            reply({ ok: true, challengeId, timeControl, rated, color, expiresInMs: CHALLENGE_TTL_MS });
         } catch (error) {
             reply({ ok: false, error: error.message });
         }
@@ -1368,13 +1414,14 @@ io.on("connection", (socket) => {
                 joinedAt: order,
             });
 
-            // Colours are drawn at random.
-            const challengerFirst = Math.random() < 0.5;
+            // The challenger's choice, otherwise the colours are drawn.
+            const challengerFirst =
+                challenge.color === "w" ? true : challenge.color === "b" ? false : Math.random() < 0.5;
 
             startPvPGame(
                 asPlayer(challenger, challengerSocket.id, challengerFirst ? 0 : 1),
                 asPlayer(me, socket.id, challengerFirst ? 1 : 0),
-                { friendly: true, challenge: true }
+                { friendly: !challenge.rated, challenge: true, timeControl: challenge.timeControl }
             );
 
             reply({ ok: true });
@@ -1460,6 +1507,7 @@ io.on("connection", (socket) => {
             name,
             avatar,
             rating,
+            timeControl: resolveTimeControl(data?.timeControl),
             joinedAt: Date.now(),
         };
 
@@ -1467,7 +1515,7 @@ io.on("connection", (socket) => {
 
         if (!opponent) {
             matchmakingQueue.push(player);
-            socket.emit("waiting");
+            socket.emit("waiting", { timeControl: player.timeControl });
 
             console.log("PLAYER WAITING:", {
                 id: player.id,
@@ -1786,7 +1834,7 @@ io.on("connection", (socket) => {
         // Farben tauschen: wer eben Schwarz war, spielt jetzt Weiß und
         // umgekehrt - deshalb w/b bewusst vertauscht befüllt.
         const newRoomId = `${crypto.randomUUID()}`;
-        const newGame = createPvPGame();
+        const newGame = createPvPGame(info.timeControl);
 
         newGame.players.w = oldBlackId;
         newGame.players.b = oldWhiteId;
@@ -1827,6 +1875,8 @@ io.on("connection", (socket) => {
             whiteTime: newGame.whiteTime,
             blackTime: newGame.blackTime,
             increment: newGame.increment,
+            timeControl: newGame.timeControl,
+            friendly: newGame.friendly,
         });
 
         console.log("REMATCH STARTED:", {
