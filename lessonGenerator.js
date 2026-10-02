@@ -8,44 +8,44 @@ const MIN_OWN_EXAMPLES = 2;
 // mistake_type in Wirklichkeit keine Phase enthält (die steht separat in phase).
 const SEVERITY_TEXT = {
   blunder: {
-    title: "Patzer",
+    title: "Blunder",
     explanation:
-      "Ein Patzer bedeutet meist, dass eine taktische Erwiderung des Gegners übersehen wurde - " +
-      "eine Figur hängt, oder ein Gabel-/Fesselungs-/Spieß-Motiv wurde nicht gesehen.",
+      "A blunder usually means a tactical reply by the opponent was overlooked - " +
+      "a piece is hanging, or a fork, pin or skewer was missed.",
   },
   mistake: {
-    title: "Fehler",
+    title: "Mistake",
     explanation:
-      "Kein sofortiger Materialverlust, aber ein spürbarer Stellungsnachteil - meist ein " +
-      "strategischer Fehlgriff oder ein zu früh erzwungener Abtausch.",
+      "No immediate loss of material, but a noticeable positional disadvantage - usually a " +
+      "strategic misjudgement or an exchange that was forced too early.",
   },
   inaccuracy: {
-    title: "Ungenauigkeit",
+    title: "Inaccuracy",
     explanation:
-      "Eine kleine Abweichung vom besten Zug, die die Stellung noch nicht entscheidend verschlechtert, " +
-      "aber Zug für Zug Substanz kostet.",
+      "A small deviation from the best move that does not decisively worsen the position yet, " +
+      "but costs a little with every move.",
   },
   missed_win: {
-    title: "Gewinn verpasst",
+    title: "Missed win",
     explanation:
-      "Die Stellung war klar gewonnen, der gespielte Zug hat den Vorteil aber deutlich verkleinert. " +
-      "Typisch dafür: zu schnell gespielt, statt die klarste Fortsetzung zu suchen.",
+      "The position was clearly winning, but the move played reduced the advantage considerably. " +
+      "Typical cause: playing too fast instead of looking for the clearest continuation.",
   },
   slip: {
-    title: "Ausrutscher in einer Serie guter Züge",
+    title: "Slip in a series of good moves",
     explanation:
-      "Nach mehreren starken Zügen in Folge kommt hier eine kleine Ungenauigkeit - oft ein " +
-      "Konzentrationsabfall, wenn die Stellung schon gut aussieht.",
+      "After several strong moves in a row comes a small inaccuracy - often a " +
+      "drop in concentration once the position already looks good.",
   },
 };
 
 const MOTIF_TEXT = {
-  fork: "Der verpasste Zug hätte eine Gabel ausgenutzt - eine Figur hätte gleichzeitig zwei gegnerische Ziele angegriffen.",
-  pin: "Der verpasste Zug hätte eine Fesselung ausgenutzt - eine gegnerische Figur konnte sich nicht bewegen, ohne eine wertvollere Figur (oder den König) dahinter preiszugeben.",
-  skewer: "Der verpasste Zug hätte einen Spieß ausgenutzt - die wertvollere gegnerische Figur stand vorne und musste ausweichen, wodurch die Figur dahinter angreifbar wurde.",
+  fork: "The missed move would have used a fork - one piece attacking two enemy targets at the same time.",
+  pin: "The missed move would have used a pin - an enemy piece could not move without exposing a more valuable piece (or the king) behind it.",
+  skewer: "The missed move would have used a skewer - the more valuable enemy piece stood in front and had to move away, leaving the piece behind it open to attack.",
 };
 
-const PHASE_LABEL = { opening: "in der Eröffnung", middlegame: "im Mittelspiel", endgame: "im Endspiel" };
+const PHASE_LABEL = { opening: "in the opening", middlegame: "in the middlegame", endgame: "in the endgame" };
 
 function dominantPhase(rows) {
   const counts = {};
@@ -79,7 +79,7 @@ export async function generateLesson(userId, mistakeType) {
 
   let explanation = severity.explanation;
   if (phase) {
-    explanation += ` Bei dir passiert das am häufigsten ${PHASE_LABEL[phase] ?? phase}.`;
+    explanation += ` For you this happens most often ${PHASE_LABEL[phase] ?? phase}.`;
   }
   if (dominantMotif && MOTIF_TEXT[dominantMotif]) {
     explanation += ` ${MOTIF_TEXT[dominantMotif]}`;

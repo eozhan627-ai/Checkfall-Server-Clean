@@ -27,10 +27,10 @@ function clanRoom(clanId) {
 }
 
 function computeLeague(avgRating) {
-    if (avgRating >= 1600) return "Diamant";
-    if (avgRating >= 1400) return "Platin";
+    if (avgRating >= 1600) return "Diamond";
+    if (avgRating >= 1400) return "Platinum";
     if (avgRating >= 1200) return "Gold";
-    if (avgRating >= 1000) return "Silber";
+    if (avgRating >= 1000) return "Silver";
     return "Bronze";
 }
 
@@ -41,7 +41,7 @@ async function getUsername(userId) {
         .eq("id", userId)
         .maybeSingle();
 
-    return data?.username || "Unbekannt";
+    return data?.username || "Unknown";
 }
 
 async function getMembership(clanId, userId) {
@@ -256,7 +256,7 @@ export function setupClanHandlers(io, { authenticatedUsers }) {
                     username,
                 });
 
-                await postSystemMessage(clanId, `${username} ist dem Clan beigetreten.`);
+                await postSystemMessage(clanId, `${username} joined the clan.`);
                 await recomputeLeague(clanId);
 
                 return {};
@@ -310,7 +310,7 @@ export function setupClanHandlers(io, { authenticatedUsers }) {
                             .eq("user_id", successor.user_id);
 
                         const successorName = await getUsername(successor.user_id);
-                        successorMessage = `${successorName} ist der neue Anführer.`;
+                        successorMessage = `${successorName} is the new leader.`;
                     }
                 }
 
@@ -319,7 +319,7 @@ export function setupClanHandlers(io, { authenticatedUsers }) {
                     username,
                 });
 
-                await postSystemMessage(clanId, `${username} hat den Clan verlassen.`);
+                await postSystemMessage(clanId, `${username} left the clan.`);
                 if (successorMessage) await postSystemMessage(clanId, successorMessage);
                 await recomputeLeague(clanId);
 
@@ -573,7 +573,7 @@ export function setupClanHandlers(io, { authenticatedUsers }) {
                     username,
                 });
 
-                await postSystemMessage(invite.clan_id, `${username} ist dem Clan beigetreten.`);
+                await postSystemMessage(invite.clan_id, `${username} joined the clan.`);
                 await recomputeLeague(invite.clan_id);
 
                 return { clanId: invite.clan_id };
@@ -606,7 +606,7 @@ export function setupClanHandlers(io, { authenticatedUsers }) {
                 const username = await getUsername(userId);
 
                 io.to(clanRoom(clanId)).emit("clan_member_promoted", { userId, username });
-                await postSystemMessage(clanId, `${username} wurde zum Admin ernannt.`);
+                await postSystemMessage(clanId, `${username} was promoted to admin.`);
 
                 return {};
             })
@@ -634,7 +634,7 @@ export function setupClanHandlers(io, { authenticatedUsers }) {
                 const username = await getUsername(userId);
 
                 io.to(clanRoom(clanId)).emit("clan_member_demoted", { userId, username });
-                await postSystemMessage(clanId, `${username} ist nun wieder normales Mitglied.`);
+                await postSystemMessage(clanId, `${username} is a regular member again.`);
 
                 return {};
             })
@@ -671,7 +671,7 @@ export function setupClanHandlers(io, { authenticatedUsers }) {
                 const username = await getUsername(userId);
 
                 io.to(clanRoom(clanId)).emit("clan_member_left", { userId, username, kicked: true });
-                await postSystemMessage(clanId, `${username} wurde aus dem Clan entfernt.`);
+                await postSystemMessage(clanId, `${username} was removed from the clan.`);
                 await recomputeLeague(clanId);
 
                 notifyUser(userId, "kicked_from_clan", { clanId });

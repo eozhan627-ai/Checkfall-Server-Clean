@@ -10,6 +10,8 @@ import { setupClanHandlers } from "./clanSocket.js";
 import { setupCoachHandlers } from "./coachSocket.js"; // NEU
 import { setupCoachProfileHandlers } from "./coachProfileSocket.js"; // NEU
 import { setupAnalysisHandlers } from "./stockfishSocket.js"; // NEU
+import { supabaseAdmin } from "./supabaseAdmin.js";
+import { calculateGameRatings } from "./elo.js";
 
 
 
@@ -30,6 +32,35 @@ const MAX_MOVES_PER_2S = 12;
 // NEU: wie lange nach Partieende eine Revanche noch möglich ist, bevor der
 // Snapshot (Namen/Ratings/authIds) wieder verworfen wird.
 const REMATCH_WINDOW_MS = 10 * 60 * 1000;
+
+// Start ratings a new player may pick in the skill-level screen. Must match
+// the list in the app (app/auth/skillLevel.tsx).
+const ALLOWED_INITIAL_RATINGS = [400, 700, 1000, 1500, 2000];
+
+const DEFAULT_RATING = 1000;
+const MAX_GUEST_RATING = 3200;
+
+// CORS for the HTTP endpoints (the web build sends an Authorization header,
+// which triggers a preflight request).
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+
+    if (ALLOWED_ORIGINS === "*") {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+    } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+    }
+
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+
+    if (req.method === "OPTIONS") {
+        return res.sendStatus(204);
+    }
+
+    next();
+});
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -58,6 +89,57 @@ const io = new Server(server, {
     cors: {
         origin: ALLOWED_ORIGINS,
     },
+});
+
+// =============================
+// AUTHENTICATION
+// =============================
+// The user id is NEVER taken from the client. The client sends its Supabase
+// access token; we ask Supabase who that token belongs to.
+
+async function verifyAccessToken(token) {
+    if (!supabaseAdmin) return null;
+    if (typeof token !== "string" || token.length === 0 || token.length > 8192) {
+        return null;
+    }
+
+    try {
+        const { data, error } = await supabaseAdmin.auth.getUser(token);
+        if (error || !data?.user?.id) return null;
+        return data.user.id;
+    } catch (error) {
+        console.log("TOKEN VERIFY ERROR:", error?.message);
+        return null;
+    }
+}
+
+async function getAuthIdFromRequest(req) {
+    const header = req.headers.authorization || "";
+    const match = /^Bearer (.+)$/i.exec(header);
+    if (!match) return null;
+    return verifyAccessToken(match[1].trim());
+}
+
+// Sockets without a token are guests (socket.data.authId stays null).
+// Sockets with a token must have a valid one - otherwise the connection is
+// refused, so the client can refresh its session and retry.
+io.use(async (socket, next) => {
+    socket.data.authId = null;
+
+    const token = socket.handshake.auth?.accessToken;
+
+    if (!token) {
+        return next();
+    }
+
+    const authId = await verifyAccessToken(token);
+
+    if (!authId) {
+        return next(new Error("INVALID_TOKEN"));
+    }
+
+    socket.data.authId = authId;
+    next();
 });
 
 
@@ -375,14 +457,7 @@ setInterval(() => {
         }
 
         if (g.whiteTime <= 0 || g.blackTime <= 0) {
-            const winnerSocket = g.whiteTime <= 0 ? g.players.b : g.players.w;
-
-            io.to(roomId).emit("game_over", {
-                type: "timeout",
-                winner: winnerSocket,
-            });
-
-            cleanupRoom(roomId);
+            finishPvPGame(roomId, "timeout", g.whiteTime <= 0 ? "b" : "w");
             continue;
         }
 
@@ -414,6 +489,110 @@ setInterval(() => {
 
 
 // =============================
+// GAME END (PvP) - RATINGS ARE DECIDED HERE, NOT IN THE CLIENT
+// =============================
+
+async function persistGameResult(authId, { rating, won }) {
+    if (!supabaseAdmin || !authId) return;
+
+    try {
+        const { data: profile, error: readError } = await supabaseAdmin
+            .from("profiles")
+            .select("games_played, wins")
+            .eq("id", authId)
+            .maybeSingle();
+
+        if (readError) throw readError;
+
+        const { error } = await supabaseAdmin
+            .from("profiles")
+            .update({
+                rating,
+                games_played: (profile?.games_played ?? 0) + 1,
+                wins: (profile?.wins ?? 0) + (won ? 1 : 0),
+                updated_at: new Date().toISOString(),
+            })
+            .eq("id", authId);
+
+        if (error) throw error;
+    } catch (error) {
+        console.error("PERSIST GAME RESULT ERROR:", { authId, message: error?.message });
+    }
+}
+
+// type: "checkmate" | "timeout" | "resign" | "disconnect" | "draw"
+// winnerColor: "w" | "b" | null (draw)
+function finishPvPGame(roomId, type, winnerColor) {
+    const g = games.get(roomId);
+    if (!g || g.finished) return;
+
+    g.finished = true;
+
+    // A game only counts for the rating when both players are logged in.
+    // Guests send their own rating, so it cannot be trusted.
+    const rated = Boolean(g.authIds.w && g.authIds.b);
+
+    const before = { w: g.ratings.w, b: g.ratings.b };
+    const computed = calculateGameRatings(before, winnerColor);
+
+    const after = {
+        // Logged-in player in an unrated game: rating stays as it is.
+        // Guest: the new value is only ever stored on the guest's own device.
+        w: g.authIds.w && !rated ? before.w : computed.w,
+        b: g.authIds.b && !rated ? before.b : computed.b,
+    };
+
+    const payload = { type, rated };
+
+    if (winnerColor) {
+        payload.winner = g.players[winnerColor];
+        payload.winnerColor = winnerColor;
+    }
+
+    io.to(roomId).emit("game_over", payload);
+
+    for (const color of ["w", "b"]) {
+        const socketId = g.players[color];
+        if (!socketId) continue;
+
+        io.to(socketId).emit("rating_update", {
+            roomId,
+            rated,
+            rating: after[color],
+            previousRating: before[color],
+        });
+    }
+
+    // New ratings are kept for a possible rematch.
+    g.ratings = after;
+
+    const authIds = { ...g.authIds };
+
+    cleanupRoom(roomId);
+
+    if (rated) {
+        persistGameResult(authIds.w, { rating: after.w, won: winnerColor === "w" });
+        persistGameResult(authIds.b, { rating: after.b, won: winnerColor === "b" });
+    }
+}
+
+function cleanupBotRoom(roomId) {
+    const bot = botGames.get(roomId);
+    if (!bot) return;
+
+    if (bot.engine) {
+        try {
+            bot.engine.stdin.write("quit\n");
+            bot.engine.kill();
+        } catch (error) {
+            console.log("ENGINE KILL ERROR:", error);
+        }
+    }
+
+    botGames.delete(roomId);
+}
+
+// =============================
 // ROOM CLEANUP
 // =============================
 
@@ -435,16 +614,7 @@ function cleanupRoom(roomId) {
 
     games.delete(roomId);
 
-    const bot = botGames.get(roomId);
-    if (bot?.engine) {
-        try {
-            bot.engine.stdin.write("quit\n");
-            bot.engine.kill();
-        } catch (error) {
-            console.log("ENGINE KILL ERROR:", error);
-        }
-    }
-    botGames.delete(roomId);
+    cleanupBotRoom(roomId);
 
     const timer = disconnectTimers.get(roomId);
     if (timer) {
@@ -755,15 +925,20 @@ app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
             return res.status(400).json({ error: "No avatar uploaded" });
         }
 
-        if (!isNonEmptyString(req.body.userId, 128)) {
-            return res.status(400).json({ error: "Missing or invalid userId" });
+        // The user is identified by the access token, never by a value the
+        // client puts in the form - otherwise anyone could overwrite anyone's
+        // avatar.
+        const authId = await getAuthIdFromRequest(req);
+
+        if (!authId) {
+            return res.status(401).json({ error: "Not signed in" });
         }
 
         const result = await new Promise((resolve, reject) => {
             const stream = cloudinary.uploader.upload_stream(
                 {
                     folder: "checkfall/avatars",
-                    public_id: req.body.userId,
+                    public_id: authId,
                     overwrite: true,
                     resource_type: "image",
                 },
@@ -778,10 +953,69 @@ app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
 
         console.log("AVATAR UPLOADED:", result.secure_url);
 
+        const { error: profileError } = await supabaseAdmin
+            .from("profiles")
+            .update({ avatar: result.secure_url, updated_at: new Date().toISOString() })
+            .eq("id", authId);
+
+        if (profileError) {
+            console.error("AVATAR PROFILE UPDATE ERROR:", profileError.message);
+        }
+
         res.json({ success: true, url: result.secure_url });
     } catch (error) {
         console.error("AVATAR UPLOAD ERROR:", error);
         res.status(500).json({ error: "Avatar upload failed" });
+    }
+});
+
+// =============================
+// INITIAL RATING (skill-level screen after sign-up)
+// =============================
+// Only allowed while the player has not finished a rated game yet, and only
+// with one of the fixed start values.
+
+app.post("/set-initial-rating", async (req, res) => {
+    try {
+        const authId = await getAuthIdFromRequest(req);
+
+        if (!authId) {
+            return res.status(401).json({ error: "Not signed in" });
+        }
+
+        const rating = Number(req.body?.rating);
+
+        if (!ALLOWED_INITIAL_RATINGS.includes(rating)) {
+            return res.status(400).json({ error: "Invalid rating" });
+        }
+
+        const { data: profile, error: readError } = await supabaseAdmin
+            .from("profiles")
+            .select("games_played")
+            .eq("id", authId)
+            .maybeSingle();
+
+        if (readError) throw readError;
+
+        if (!profile) {
+            return res.status(404).json({ error: "Profile not found" });
+        }
+
+        if ((profile.games_played ?? 0) > 0) {
+            return res.status(409).json({ error: "Rating can no longer be changed" });
+        }
+
+        const { error } = await supabaseAdmin
+            .from("profiles")
+            .update({ rating, updated_at: new Date().toISOString() })
+            .eq("id", authId);
+
+        if (error) throw error;
+
+        res.json({ success: true, rating });
+    } catch (error) {
+        console.error("SET INITIAL RATING ERROR:", error?.message);
+        res.status(500).json({ error: "Rating could not be saved" });
     }
 });
 
@@ -803,13 +1037,10 @@ io.on("connection", (socket) => {
         socket.emit("online_count", { count: io.engine.clientsCount });
     });
 
-    socket.on("authenticate_socket", (data) => {
-        const authId = data?.authId;
-
-        if (!isNonEmptyString(authId, 128)) {
-            console.log("SOCKET AUTH: missing/invalid authId", socket.id);
-            return;
-        }
+    // The user id comes from the verified token (see io.use above). Runs
+    // once per connection: single-session kick + resume of a running game.
+    if (socket.data.authId) {
+        const authId = socket.data.authId;
 
         const oldSocketId = authenticatedUsers.get(authId);
 
@@ -832,50 +1063,61 @@ io.on("connection", (socket) => {
         }
 
         authenticatedUsers.set(authId, socket.id);
-        socket.data.authId = authId;
 
         socket.emit("socket_authenticated");
 
         const roomId = authIdToRoom.get(authId);
         const g = roomId ? games.get(roomId) : null;
+        const color = g
+            ? g.authIds.w === authId
+                ? "w"
+                : g.authIds.b === authId
+                    ? "b"
+                    : null
+            : null;
 
-        if (!g) return;
+        if (g && color) {
+            g.players[color] = socket.id;
+            socketToRoom.set(socket.id, roomId);
+            socket.join(roomId);
 
-        const color = g.authIds.w === authId ? "w" : g.authIds.b === authId ? "b" : null;
-        if (!color) return;
+            const timer = disconnectTimers.get(roomId);
+            if (timer) {
+                clearTimeout(timer.timeout);
+                disconnectTimers.delete(roomId);
+            }
 
-        g.players[color] = socket.id;
-        socketToRoom.set(socket.id, roomId);
-        socket.join(roomId);
+            g.paused = false;
+            g.lastTick = Date.now();
 
-        const timer = disconnectTimers.get(roomId);
-        if (timer) {
-            clearTimeout(timer.timeout);
-            disconnectTimers.delete(roomId);
+            socket.emit("game_start", {
+                roomId,
+                white: g.players.w,
+                black: g.players.b,
+                fen: g.game.fen(),
+                whiteTime: g.whiteTime,
+                blackTime: g.blackTime,
+                activeColor: g.activeColor,
+                increment: g.increment,
+                whiteRating: g.ratings.w,
+                blackRating: g.ratings.b,
+                whiteAuthId: g.authIds.w,
+                blackAuthId: g.authIds.b,
+                resumed: true,
+            });
+
+            io.to(roomId).emit("opponent_reconnected", { color });
+
+            console.log("PLAYER RECONNECTED:", { authId, roomId, color });
         }
+    }
 
-        g.paused = false;
-        g.lastTick = Date.now();
-
-        socket.emit("game_start", {
-            roomId,
-            white: g.players.w,
-            black: g.players.b,
-            fen: g.game.fen(),
-            whiteTime: g.whiteTime,
-            blackTime: g.blackTime,
-            activeColor: g.activeColor,
-            increment: g.increment,
-            whiteRating: g.ratings.w,
-            blackRating: g.ratings.b,
-            whiteAuthId: g.authIds.w,
-            blackAuthId: g.authIds.b,
-            resumed: true,
-        });
-
-        io.to(roomId).emit("opponent_reconnected", { color });
-
-        console.log("PLAYER RECONNECTED:", { authId, roomId, color });
+    // Kept so older app versions that still send this event get an answer.
+    // The payload is ignored on purpose.
+    socket.on("authenticate_socket", () => {
+        if (socket.data.authId) {
+            socket.emit("socket_authenticated");
+        }
     });
 
     socket.on("check_friends_online", (data) => {
@@ -888,29 +1130,82 @@ io.on("connection", (socket) => {
         socket.emit("friends_online_status", { online });
     });
 
-    socket.on("find_match", (data) => {
+    socket.on("find_match", async (data) => {
+        if (socket.data.findingMatch) return;
+
         if (matchmakingQueue.some((p) => p.id === socket.id)) {
             console.log("Already waiting:", socket.id);
             return;
         }
 
-        const rating = Number(data?.rating);
-
-        if (!Number.isFinite(rating) || rating < 0) {
-            socket.emit("matchmaking_error", { message: "Invalid rating" });
+        if (socketToRoom.has(socket.id) && games.has(socketToRoom.get(socket.id))) {
+            socket.emit("matchmaking_error", { message: "You are already in a game" });
             return;
         }
 
-        if (!isNonEmptyString(data?.name, 60)) {
-            socket.emit("matchmaking_error", { message: "Invalid name" });
-            return;
+        const authId = socket.data.authId || null;
+
+        let name;
+        let avatar;
+        let rating;
+
+        if (authId) {
+            // Logged-in players: name, avatar and rating come from the
+            // database, not from the client.
+            socket.data.findingMatch = true;
+
+            let profile = null;
+
+            try {
+                const result = await supabaseAdmin
+                    .from("profiles")
+                    .select("username, avatar, rating")
+                    .eq("id", authId)
+                    .maybeSingle();
+
+                profile = result.data;
+            } catch (error) {
+                console.log("FIND MATCH PROFILE ERROR:", error?.message);
+            } finally {
+                socket.data.findingMatch = false;
+            }
+
+            if (!profile?.username) {
+                socket.emit("matchmaking_error", { message: "Profile not found" });
+                return;
+            }
+
+            // The socket may have gone away or queued itself while we waited.
+            if (!socket.connected) return;
+            if (matchmakingQueue.some((p) => p.id === socket.id)) return;
+
+            name = profile.username;
+            avatar = profile.avatar || "";
+            rating = Number.isFinite(profile.rating) ? profile.rating : DEFAULT_RATING;
+        } else {
+            rating = Number(data?.rating);
+
+            if (!Number.isFinite(rating) || rating < 0) {
+                socket.emit("matchmaking_error", { message: "Invalid rating" });
+                return;
+            }
+
+            rating = Math.min(MAX_GUEST_RATING, Math.round(rating));
+
+            if (!isNonEmptyString(data?.name, 60)) {
+                socket.emit("matchmaking_error", { message: "Invalid name" });
+                return;
+            }
+
+            name = data.name;
+            avatar = isNonEmptyString(data?.avatar, 500) ? data.avatar : "";
         }
 
         const player = {
             id: socket.id,
-            authId: socket.data.authId || null,
-            name: data.name,
-            avatar: isNonEmptyString(data?.avatar, 500) ? data.avatar : "",
+            authId,
+            name,
+            avatar,
             rating,
             joinedAt: Date.now(),
         };
@@ -941,6 +1236,9 @@ io.on("connection", (socket) => {
 
     socket.on("find_bot_match", (data) => {
         const roomId = `bot_${socket.id}`;
+
+        // Restarting a bot game must not leave the old engine process running.
+        cleanupBotRoom(roomId);
 
         socket.join(roomId);
 
@@ -1002,7 +1300,19 @@ io.on("connection", (socket) => {
         }
     });
 
-    socket.on("player_move", ({ roomId, move: rawMove }) => {
+    // The bot screen was closed - stop the engine for this socket.
+    socket.on("leave_bot_game", () => {
+        const roomId = `bot_${socket.id}`;
+
+        cleanupBotRoom(roomId);
+        socket.leave(roomId);
+
+        if (socketToRoom.get(socket.id) === roomId) {
+            socketToRoom.delete(socket.id);
+        }
+    });
+
+    socket.on("player_move", ({ roomId, move: rawMove } = {}) => {
         if (!isNonEmptyString(roomId, 200)) {
             return;
         }
@@ -1020,6 +1330,8 @@ io.on("connection", (socket) => {
         const bot = botGames.get(roomId);
 
         if (bot) {
+            if (roomId !== `bot_${socket.id}`) return;
+
             const humanColor = bot.botColor === "w" ? "b" : "w";
 
             if (bot.game.turn() !== humanColor) {
@@ -1101,21 +1413,15 @@ io.on("connection", (socket) => {
 
         if (g.game.isGameOver()) {
             if (g.game.isCheckmate()) {
-                const winner = g.game.turn() === "w" ? g.players.b : g.players.w;
-
-                io.to(roomId).emit("game_over", {
-                    type: "checkmate",
-                    winner,
-                });
+                // The side to move is the one that got mated.
+                finishPvPGame(roomId, "checkmate", g.game.turn() === "w" ? "b" : "w");
             } else {
-                io.to(roomId).emit("game_over", { type: "draw" });
+                finishPvPGame(roomId, "draw", null);
             }
-
-            cleanupRoom(roomId);
         }
     });
 
-    socket.on("offer_draw", ({ roomId }) => {
+    socket.on("offer_draw", ({ roomId } = {}) => {
         if (!isNonEmptyString(roomId, 200)) return;
 
         const g = games.get(roomId);
@@ -1123,39 +1429,45 @@ io.on("connection", (socket) => {
         if (socket.id !== g.players.w && socket.id !== g.players.b) return;
 
         const opponent = socket.id === g.players.w ? g.players.b : g.players.w;
+
+        // Remember who offered, so only the OTHER player can accept.
+        g.drawOfferedBy = socket.id;
+
         io.to(opponent).emit("draw_offer");
     });
 
-    socket.on("answer_draw", ({ roomId, accept }) => {
+    socket.on("answer_draw", ({ roomId, accept } = {}) => {
         if (!isNonEmptyString(roomId, 200)) return;
 
         const g = games.get(roomId);
         if (!g) return;
         if (socket.id !== g.players.w && socket.id !== g.players.b) return;
 
+        // Without this check a player could "accept" a draw nobody offered
+        // (or their own offer) and escape a lost position.
+        if (!g.drawOfferedBy || g.drawOfferedBy === socket.id) return;
+
+        g.drawOfferedBy = null;
+
         if (accept) {
-            io.to(roomId).emit("game_over", { type: "draw" });
-            cleanupRoom(roomId);
+            finishPvPGame(roomId, "draw", null);
         } else {
             const opponent = socket.id === g.players.w ? g.players.b : g.players.w;
             io.to(opponent).emit("draw_declined");
         }
     });
 
-    socket.on("resign_game", ({ roomId }) => {
+    socket.on("resign_game", ({ roomId } = {}) => {
         if (!isNonEmptyString(roomId, 200)) return;
 
         const g = games.get(roomId);
         if (!g) return;
         if (socket.id !== g.players.w && socket.id !== g.players.b) return;
 
-        const winner = socket.id === g.players.w ? g.players.b : g.players.w;
-
-        io.to(roomId).emit("game_over", { type: "resign", winner });
-        cleanupRoom(roomId);
+        finishPvPGame(roomId, "resign", socket.id === g.players.w ? "b" : "w");
     });
 
-    socket.on("send_chat_message", ({ roomId, message }) => {
+    socket.on("send_chat_message", ({ roomId, message } = {}) => {
         if (!isNonEmptyString(roomId, 200) || !isNonEmptyString(message, 300)) {
             return;
         }
@@ -1177,15 +1489,17 @@ io.on("connection", (socket) => {
 
     // GEÄNDERT: eine Revanche startet jetzt tatsächlich eine neue Partie
     // mit denselben beiden Spielern, Farben getauscht.
-    socket.on("rematch_request", ({ roomId }) => {
+    socket.on("rematch_request", ({ roomId } = {}) => {
         if (!isNonEmptyString(roomId, 200)) return;
+        if (!io.sockets.adapter.rooms.get(roomId)?.has(socket.id)) return;
 
         socket.to(roomId).emit("rematch_offer");
         socket.emit("rematch_requested");
     });
 
-    socket.on("rematch_answer", ({ roomId, accept }) => {
+    socket.on("rematch_answer", ({ roomId, accept } = {}) => {
         if (!isNonEmptyString(roomId, 200)) return;
+        if (!io.sockets.adapter.rooms.get(roomId)?.has(socket.id)) return;
 
         if (!accept) {
             socket.to(roomId).emit("rematch_declined");
@@ -1196,7 +1510,7 @@ io.on("connection", (socket) => {
 
         if (!info) {
             io.to(roomId).emit("rematch_error", {
-                message: "Die Revanche ist nicht mehr möglich.",
+                message: "A rematch is no longer possible.",
             });
             return;
         }
@@ -1209,7 +1523,7 @@ io.on("connection", (socket) => {
 
         if (!oldWhiteSocket || !oldBlackSocket) {
             io.to(roomId).emit("rematch_error", {
-                message: "Dein Gegner ist nicht mehr online.",
+                message: "Your opponent is no longer online.",
             });
             return;
         }
@@ -1305,28 +1619,14 @@ io.on("connection", (socket) => {
                     const stillMissing = games.get(roomId);
                     if (!stillMissing) return;
 
-                    const winner = color === "w" ? stillMissing.players.b : stillMissing.players.w;
-
-                    io.to(roomId).emit("game_over", {
-                        type: "disconnect",
-                        winner,
-                    });
-
-                    cleanupRoom(roomId);
+                    finishPvPGame(roomId, "disconnect", color === "w" ? "b" : "w");
                 }, RECONNECT_GRACE_MS);
 
                 disconnectTimers.set(roomId, { timeout, color, authId });
                 return;
             }
 
-            const winner = g.players.w === socket.id ? g.players.b : g.players.w;
-
-            io.to(roomId).emit("game_over", {
-                type: "disconnect",
-                winner,
-            });
-
-            cleanupRoom(roomId);
+            finishPvPGame(roomId, "disconnect", g.players.w === socket.id ? "b" : "w");
             return;
         }
 

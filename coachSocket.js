@@ -51,13 +51,13 @@ export function setupCoachHandlers(io) {
                 const move = typeof moveIndex === "number" && moveIndex > 0 ? moves[moveIndex - 1] : null;
 
                 const contextText = move
-                    ? `Zug ${move.moveNumber} (${move.san}), Klassifizierung "${move.classification}", Stellungsbewertung danach: ${move.evalCp} Centipawns (positiv = Vorteil Weiss).`
-                    : `Allgemeine Frage zur Partie. PGN: ${game.pgn}`;
+                    ? `Move ${move.moveNumber} (${move.san}), classification "${move.classification}", evaluation after the move: ${move.evalCp} centipawns (positive = advantage for White).`
+                    : `General question about the game. PGN: ${game.pgn}`;
 
                 const systemPrompt =
-                    `Du bist ${COACH_NAME}, ein freundlicher, aufmunternder Schach-Coach in der App POV Check. ` +
-                    "Erklaere Schachzuege verstaendlich fuer Hobbyspieler, konkret und kurz (max. 4 Saetze), " +
-                    "ohne Fachjargon zu ueberladen. Sei ermutigend, auch bei Fehlern.";
+                    `You are ${COACH_NAME}, a friendly, encouraging chess coach in the app POVCheck. ` +
+                    "Explain chess moves clearly for hobby players, concretely and briefly (max. 4 sentences), " +
+                    "without too much jargon. Be encouraging, even about mistakes. Always answer in English.";
 
                 const response = await fetch("https://api.anthropic.com/v1/messages", {
                     method: "POST",
@@ -70,12 +70,12 @@ export function setupCoachHandlers(io) {
                         model: MODEL,
                         max_tokens: 400,
                         system: systemPrompt,
-                        messages: [{ role: "user", content: `${contextText}\n\nFrage: ${question.trim()}` }],
+                        messages: [{ role: "user", content: `${contextText}\n\nQuestion: ${question.trim()}` }],
                     }),
                 });
 
                 const data = await response.json();
-                const answer = data?.content?.[0]?.text || "Entschuldige, da ist etwas schiefgelaufen.";
+                const answer = data?.content?.[0]?.text || "Sorry, something went wrong.";
 
                 await supabaseAdmin
                     .from("coach_usage")
