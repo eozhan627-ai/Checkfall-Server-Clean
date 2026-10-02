@@ -13,6 +13,7 @@ import {
     scoreToCp,
     terminalEvaluation,
 } from "./analysisCore.js";
+import { addUsage, getUsage, quotaFor, FREE_PER_DAY, ADS_PER_DAY } from "./analysisQuota.js";
 
 // =============================
 // SPEED / QUALITY PER VIP TIER
@@ -27,6 +28,9 @@ const PROFILE_BY_TIER = {
     gold: { depth: 16, budgetMs: 22000, maxMs: 900 },
     diamond: { depth: 22, budgetMs: 30000, maxMs: 1500 },
 };
+
+// Players without VIP: a quicker look, limited per day (see analysisQuota.js).
+const FREE_PROFILE = { depth: 12, budgetMs: 12000, maxMs: 500 };
 
 const MIN_MOVETIME_MS = 200;
 // Positions that are still opening theory only need a quick look.
@@ -68,8 +72,23 @@ function releaseSlot() {
 // game that is already being analysed just joins the first one.
 const running = new Map();
 
+// Analyses that were unlocked with an ad. The engine starts right away, so
+// the result is ready when the ad ends - but it is only saved and sent once
+// the app reports that the ad was watched ("analysis_ad_done").
+//   gameId -> { authId, released, finish, sockets, timer }
+const adGates = new Map();
+const AD_GATE_TTL_MS = 10 * 60 * 1000;
+
+function closeAdGate(gameId) {
+    const gate = adGates.get(gameId);
+    if (!gate) return;
+
+    clearTimeout(gate.timer);
+    adGates.delete(gameId);
+}
+
 function emitToGame(gameId, event, payload) {
-    const sockets = running.get(gameId);
+    const sockets = running.get(gameId) ?? adGates.get(gameId)?.sockets;
     if (!sockets) return;
 
     for (const socket of sockets) {
@@ -106,8 +125,8 @@ export function setupAnalysisHandlers(io) {
                     .maybeSingle();
 
                 const tier = profile?.vip_tier || "none";
-                const settings = PROFILE_BY_TIER[tier];
-                if (!settings) throw new Error("NOT_VIP");
+                const isVip = Boolean(PROFILE_BY_TIER[tier]);
+                const settings = PROFILE_BY_TIER[tier] ?? FREE_PROFILE;
 
                 // Stored result in the current format: nothing to compute.
                 if (
@@ -124,13 +143,57 @@ export function setupAnalysisHandlers(io) {
                 // Already running (e.g. the screen was opened twice): join it.
                 if (running.has(gameId)) {
                     running.get(gameId).add(socket);
-                    if (typeof ack === "function") ack({ ok: true, started: true, joined: true });
+                    if (typeof ack === "function") {
+                        ack({ ok: true, started: true, joined: true, adLocked: adGates.has(gameId) });
+                    }
                     return;
                 }
 
-                running.set(gameId, new Set([socket]));
+                // Finished behind an ad that has not been confirmed yet.
+                if (adGates.has(gameId)) {
+                    adGates.get(gameId).sockets.add(socket);
+                    if (typeof ack === "function") ack({ ok: true, started: true, joined: true, adLocked: true });
+                    return;
+                }
 
-                if (typeof ack === "function") ack({ ok: true, started: true });
+                // ---- daily allowance without VIP ----
+                let usedFree = false;
+                let adLocked = false;
+
+                if (!isVip) {
+                    const usage = await getUsage(authId);
+
+                    if (usage.free < FREE_PER_DAY) {
+                        usedFree = true;
+                        await addUsage(authId, "free", 1);
+                    } else if (payload?.adUnlock === true) {
+                        if (usage.ad >= ADS_PER_DAY) {
+                            const error = new Error("AD_LIMIT_REACHED");
+                            error.quota = quotaFor(usage);
+                            throw error;
+                        }
+                        adLocked = true;
+                    } else {
+                        const error = new Error("DAILY_LIMIT");
+                        error.quota = quotaFor(usage);
+                        throw error;
+                    }
+                }
+
+                const sockets = new Set([socket]);
+                running.set(gameId, sockets);
+
+                if (adLocked) {
+                    adGates.set(gameId, {
+                        authId,
+                        released: false,
+                        finish: null,
+                        sockets,
+                        timer: setTimeout(() => closeAdGate(gameId), AD_GATE_TTL_MS),
+                    });
+                }
+
+                if (typeof ack === "function") ack({ ok: true, started: true, adLocked });
 
                 // The colour the user played. Older games do not have it
                 // stored, then the app sends it along.
@@ -144,18 +207,76 @@ export function setupAnalysisHandlers(io) {
                     .catch((error) => {
                         console.log("ANALYSIS ERROR:", error);
                         emitToGame(gameId, "analysis_error", { gameId, error: "ANALYSIS_FAILED" });
+
+                        // A failed analysis does not use up the allowance.
+                        if (usedFree) addUsage(authId, "free", -1).catch(() => undefined);
+                        closeAdGate(gameId);
                     })
                     .finally(() => {
                         running.delete(gameId);
                     });
             } catch (error) {
                 console.log("ANALYZE_GAME ERROR:", error.message);
-                if (typeof ack === "function") ack({ ok: false, error: error.message });
+                if (typeof ack === "function") ack({ ok: false, error: error.message, quota: error.quota });
+            }
+        });
+
+        // The ad was watched to the end: release the analysis it unlocked.
+        socket.on("analysis_ad_done", async (payload, ack) => {
+            const reply = (data) => {
+                if (typeof ack === "function") ack(data);
+            };
+
+            try {
+                const authId = socket.data.authId;
+                const gameId = payload?.gameId;
+                const gate = adGates.get(gameId);
+
+                if (!authId || !gate || gate.authId !== authId) throw new Error("NOTHING_TO_UNLOCK");
+
+                if (!gate.released) {
+                    gate.released = true;
+                    await addUsage(authId, "ad", 1);
+                }
+
+                gate.sockets.add(socket);
+
+                // Still calculating: runAnalysis() finishes it when it is done.
+                if (!gate.finish) return reply({ ok: true, ready: false });
+
+                await gate.finish();
+                closeAdGate(gameId);
+                reply({ ok: true, ready: true });
+            } catch (error) {
+                reply({ ok: false, error: error.message });
+            }
+        });
+
+        // How many analyses are left today (shown in the app).
+        socket.on("get_analysis_quota", async (_payload, ack) => {
+            if (typeof ack !== "function") return;
+
+            try {
+                const authId = socket.data.authId;
+                if (!authId) throw new Error("NOT_AUTHENTICATED");
+
+                const { data: profile } = await supabaseAdmin
+                    .from("profiles")
+                    .select("vip_tier")
+                    .eq("id", authId)
+                    .maybeSingle();
+
+                if (PROFILE_BY_TIER[profile?.vip_tier]) return ack({ ok: true, unlimited: true });
+
+                ack({ ok: true, unlimited: false, ...quotaFor(await getUsage(authId)) });
+            } catch (error) {
+                ack({ ok: false, error: error.message });
             }
         });
 
         socket.on("disconnect", () => {
             for (const sockets of running.values()) sockets.delete(socket);
+            for (const gate of adGates.values()) gate.sockets.delete(socket);
         });
     });
 }
@@ -319,14 +440,31 @@ async function runAnalysis({ gameId, game, authId, profile, settings, tier, play
     analysis.result = game.result ?? null;
     analysis.mode = game.mode ?? null;
 
-    const update = { analyzed: true, analysis };
+    // Saves the result and sends it to the app.
+    const finish = async () => {
+        const { error } = await supabaseAdmin
+            .from("games")
+            .update({ analyzed: true, analysis })
+            .eq("id", gameId);
+        if (error) console.log("SAVE ANALYSIS ERROR:", error.message);
 
-    const { error } = await supabaseAdmin.from("games").update(update).eq("id", gameId);
-    if (error) console.log("SAVE ANALYSIS ERROR:", error.message);
+        await saveMistakesForCoach({ authId, gameId, moves: analysis.moves, playerColor });
 
-    await saveMistakesForCoach({ authId, gameId, moves: analysis.moves, playerColor });
+        emitToGame(gameId, "analysis_complete", { gameId, analysis });
+    };
 
-    emitToGame(gameId, "analysis_complete", { gameId, analysis });
+    // Unlocked with an ad that is still running: keep the result until the
+    // app confirms the ad ("analysis_ad_done").
+    const gate = adGates.get(gameId);
+
+    if (gate && !gate.released) {
+        gate.finish = finish;
+        emitToGame(gameId, "analysis_waiting_for_ad", { gameId });
+        return;
+    }
+
+    await finish();
+    closeAdGate(gameId);
 }
 
 // =============================
