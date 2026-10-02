@@ -1,3 +1,4 @@
+import { Chess } from "chess.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
 
 const MIN_OWN_EXAMPLES = 2;
@@ -64,6 +65,95 @@ async function selectMistakeRows(userId, mistakeType) {
   return data || [];
 }
 
+const MOTIF_NAME = { fork: "a fork", pin: "a pin", skewer: "a skewer" };
+
+// Turns the user's own mistakes into exercises: the position right before
+// the mistake, with the engine's move as the solution. At most three, each
+// from a different game where possible.
+async function buildOwnExamples(rows) {
+  const examples = [];
+  const usedGames = new Set();
+
+  // one row per game first, then fill up
+  const ordered = [
+    ...rows.filter((r) => !usedGames.has(r.game_id) && usedGames.add(r.game_id)),
+    ...rows,
+  ];
+
+  const games = new Map();
+
+  for (const row of ordered) {
+    if (examples.length >= 3) break;
+    if (examples.some((e) => e.gameId === row.game_id && e.moveIndex === row.move_index)) continue;
+
+    if (!games.has(row.game_id)) {
+      const { data } = await supabaseAdmin
+        .from("games")
+        .select("pgn, analysis")
+        .eq("id", row.game_id)
+        .maybeSingle();
+      games.set(row.game_id, data || null);
+    }
+
+    const example = exampleFromGame(games.get(row.game_id), row);
+    if (example) examples.push(example);
+  }
+
+  return examples;
+}
+
+function exampleFromGame(game, row) {
+  const move = game?.analysis?.moves?.[row.move_index];
+  if (!game?.pgn || !move?.bestMove) return null;
+
+  try {
+    const source = new Chess();
+    source.loadPgn(game.pgn);
+    const history = source.history({ verbose: true });
+
+    if (row.move_index >= history.length) return null;
+
+    const replay = new Chess();
+    for (let i = 0; i < row.move_index; i++) {
+      replay.move({ from: history[i].from, to: history[i].to, promotion: history[i].promotion });
+    }
+
+    const fen = replay.fen();
+    const played = history[row.move_index];
+
+    const best = replay.move({
+      from: move.bestMove.slice(0, 2),
+      to: move.bestMove.slice(2, 4),
+      promotion: move.bestMove.length > 4 ? move.bestMove[4] : undefined,
+    });
+
+    // Nothing to learn if the engine's move is the one that was played.
+    if (!best || best.san === played.san) return null;
+
+    const motif = MOTIF_NAME[row.motif];
+
+    return {
+      source: "own",
+      gameId: row.game_id,
+      moveIndex: row.move_index,
+      motif: row.motif ?? null,
+      fen,
+      moves: [move.bestMove],
+      played: played.san,
+      bestSan: best.san,
+      intro: `This position is from one of your own games. You played ${played.san} here - find the better move.`,
+      hint: motif
+        ? `Look for ${motif}.`
+        : `Look at checks, captures and threats first. ${played.san} was not the best choice.`,
+      why: motif
+        ? `${best.san} is ${motif} - much stronger than ${played.san}.`
+        : `${best.san} was the engine's choice here instead of ${played.san}.`,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function generateLesson(userId, mistakeType) {
   const rows = await selectMistakeRows(userId, mistakeType);
   const severity = SEVERITY_TEXT[mistakeType];
@@ -85,9 +175,7 @@ export async function generateLesson(userId, mistakeType) {
     explanation += ` ${MOTIF_TEXT[dominantMotif]}`;
   }
 
-  const ownExamples = rows
-    .slice(0, 3)
-    .map((r) => ({ source: "own", gameId: r.game_id, moveIndex: r.move_index, motif: r.motif }));
+  const ownExamples = await buildOwnExamples(rows);
 
   let examples = ownExamples;
   if (examples.length < MIN_OWN_EXAMPLES) {

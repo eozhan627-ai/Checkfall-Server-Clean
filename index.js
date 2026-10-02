@@ -164,7 +164,7 @@ const rateBuckets = new Map();
 // nachdem cleanupRoom() das eigentliche Spiel schon gelöscht hat.
 const finishedGames = new Map();
 
-setupClanHandlers(io, { authenticatedUsers });
+setupClanHandlers(io, { authenticatedUsers, authIdToRoom });
 setupAnalysisHandlers(io);
 setupCoachHandlers(io); // NEU
 
@@ -179,7 +179,7 @@ function getBucket(socketId) {
 function allowAction(socketId, kind, maxCount, windowMs) {
     const bucket = getBucket(socketId);
     const now = Date.now();
-    bucket[kind] = bucket[kind].filter((t) => now - t < windowMs);
+    bucket[kind] = (bucket[kind] || []).filter((t) => now - t < windowMs);
 
     if (bucket[kind].length >= maxCount) {
         return false;
@@ -262,6 +262,8 @@ function createPvPGame() {
         // mögliche Revanche gebraucht (sonst nirgends dauerhaft gespeichert).
         names: { w: null, b: null },
         avatars: { w: null, b: null },
+        // Challenge between friends / clan mates: does not count for the rating.
+        friendly: false,
     };
 }
 
@@ -530,7 +532,8 @@ function finishPvPGame(roomId, type, winnerColor) {
 
     // A game only counts for the rating when both players are logged in.
     // Guests send their own rating, so it cannot be trusted.
-    const rated = Boolean(g.authIds.w && g.authIds.b);
+    // Friendly games (challenges) are never rated either.
+    const rated = Boolean(g.authIds.w && g.authIds.b) && !g.friendly;
 
     const before = { w: g.ratings.w, b: g.ratings.b };
     const computed = calculateGameRatings(before, winnerColor);
@@ -608,6 +611,7 @@ function cleanupRoom(roomId) {
             ratings: { ...g.ratings },
             names: { ...g.names },
             avatars: { ...g.avatars },
+            friendly: Boolean(g.friendly),
             endedAt: Date.now(),
         });
     }
@@ -798,13 +802,14 @@ function getEngine(botState, roomId) {
 
     return engine;
 }
-function startPvPGame(playerA, playerB) {
+function startPvPGame(playerA, playerB, options = {}) {
     const roomId = `${crypto.randomUUID()}`;
 
     io.sockets.sockets.get(playerA.id)?.join(roomId);
     io.sockets.sockets.get(playerB.id)?.join(roomId);
 
     const game = createPvPGame();
+    game.friendly = Boolean(options.friendly);
 
     const white = playerA.joinedAt <= playerB.joinedAt ? playerA : playerB;
     const black = white === playerA ? playerB : playerA;
@@ -844,6 +849,10 @@ function startPvPGame(playerA, playerB) {
         whiteTime: game.whiteTime,
         blackTime: game.blackTime,
         increment: game.increment,
+        friendly: game.friendly,
+        // Set for games that started from a challenge: the app opens the
+        // board from whatever screen the players are on.
+        challenge: Boolean(options.challenge),
     });
 
     console.log("MATCH FOUND:", {
@@ -1023,6 +1032,76 @@ app.post("/set-initial-rating", async (req, res) => {
 // SOCKET
 // =============================
 
+// =============================
+// SOCIAL HELPERS (friends, challenges)
+// =============================
+
+const CHALLENGE_TTL_MS = 30_000;
+
+// challengeId -> { from, to, timeout }
+const challenges = new Map();
+
+function emitToUser(authId, event, payload) {
+    const socketId = authenticatedUsers.get(authId);
+    if (socketId) io.to(socketId).emit(event, payload);
+}
+
+// Ends an open challenge and tells both players why.
+function closeChallenge(challengeId, event) {
+    const challenge = challenges.get(challengeId);
+    if (!challenge) return;
+
+    clearTimeout(challenge.timeout);
+    challenges.delete(challengeId);
+
+    emitToUser(challenge.from, event, { challengeId });
+    emitToUser(challenge.to, event, { challengeId });
+}
+
+async function loadPublicProfile(authId) {
+    const { data } = await supabaseAdmin
+        .from("profiles")
+        .select("id, username, avatar, rating")
+        .eq("id", authId)
+        .maybeSingle();
+
+    return data || null;
+}
+
+async function areFriends(a, b) {
+    const { data } = await supabaseAdmin
+        .from("friendships")
+        .select("id")
+        .eq("status", "accepted")
+        .or(`and(requester_id.eq.${a},addressee_id.eq.${b}),and(requester_id.eq.${b},addressee_id.eq.${a})`)
+        .maybeSingle();
+
+    return Boolean(data);
+}
+
+async function inSameClan(a, b) {
+    const { data } = await supabaseAdmin
+        .from("clan_members")
+        .select("user_id, clan_id")
+        .in("user_id", [a, b]);
+
+    const rows = data || [];
+    const clanA = rows.find((row) => row.user_id === a)?.clan_id;
+    const clanB = rows.find((row) => row.user_id === b)?.clan_id;
+
+    return Boolean(clanA) && clanA === clanB;
+}
+
+// Challenges are only possible between friends and members of the same
+// clan, so strangers cannot be spammed with them.
+async function mayChallenge(a, b) {
+    // The ids end up inside a filter string - accept nothing but real ids.
+    const uuid = /^[0-9a-f-]{36}$/i;
+    if (!uuid.test(a) || !uuid.test(b)) return false;
+
+    return (await areFriends(a, b)) || (await inSameClan(a, b));
+}
+
 io.on("connection", (socket) => {
     console.log("Connected:", socket.id);
 
@@ -1126,8 +1205,182 @@ io.on("connection", (socket) => {
             : [];
 
         const online = authIds.filter((id) => authenticatedUsers.has(id));
+        const inGame = online.filter((id) => authIdToRoom.has(id));
 
-        socket.emit("friends_online_status", { online });
+        socket.emit("friends_online_status", { online, inGame });
+    });
+
+    // =============================
+    // FRIEND REQUEST NOTIFICATIONS
+    // =============================
+    // The requests themselves are stored by the app in Supabase. These
+    // events only tell the other player right away - after checking that
+    // the request really exists.
+
+    socket.on("friend_request_sent", async (data) => {
+        const authId = socket.data.authId;
+        const target = data?.targetAuthId;
+
+        if (!authId || !isNonEmptyString(target, 128) || target === authId) return;
+        if (!allowAction(socket.id, "social", 12, 10_000)) return;
+
+        try {
+            const { data: row } = await supabaseAdmin
+                .from("friendships")
+                .select("id")
+                .eq("requester_id", authId)
+                .eq("addressee_id", target)
+                .eq("status", "pending")
+                .maybeSingle();
+
+            if (!row) return;
+
+            const from = await loadPublicProfile(authId);
+            emitToUser(target, "friend_request_received", { from });
+        } catch (error) {
+            console.log("FRIEND REQUEST NOTIFY ERROR:", error?.message);
+        }
+    });
+
+    socket.on("friend_request_accepted", async (data) => {
+        const authId = socket.data.authId;
+        const target = data?.targetAuthId;
+
+        if (!authId || !isNonEmptyString(target, 128) || target === authId) return;
+        if (!allowAction(socket.id, "social", 12, 10_000)) return;
+
+        try {
+            if (!(await areFriends(authId, target))) return;
+
+            const by = await loadPublicProfile(authId);
+            emitToUser(target, "friend_request_accepted", { by });
+        } catch (error) {
+            console.log("FRIEND ACCEPT NOTIFY ERROR:", error?.message);
+        }
+    });
+
+    // =============================
+    // CHALLENGES (friends and clan mates)
+    // =============================
+
+    socket.on("challenge_user", async (data, ack) => {
+        const reply = (payload) => {
+            if (typeof ack === "function") ack(payload);
+        };
+
+        try {
+            const authId = socket.data.authId;
+            const target = data?.targetAuthId;
+
+            if (!authId) throw new Error("NOT_AUTHENTICATED");
+            if (!isNonEmptyString(target, 128) || target === authId) throw new Error("INVALID_TARGET");
+            if (!allowAction(socket.id, "social", 12, 10_000)) throw new Error("RATE_LIMITED");
+
+            if (authIdToRoom.has(authId)) throw new Error("ALREADY_IN_GAME");
+
+            const targetSocketId = authenticatedUsers.get(target);
+            const targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
+
+            if (!targetSocket) throw new Error("TARGET_OFFLINE");
+            if (authIdToRoom.has(target)) throw new Error("TARGET_BUSY");
+
+            if (!(await mayChallenge(authId, target))) throw new Error("NOT_ALLOWED");
+
+            // One open challenge per player.
+            for (const [id, challenge] of challenges) {
+                if (challenge.from === authId) closeChallenge(id, "challenge_cancelled");
+            }
+
+            const from = await loadPublicProfile(authId);
+            if (!from) throw new Error("PROFILE_NOT_FOUND");
+
+            const challengeId = crypto.randomUUID();
+
+            challenges.set(challengeId, {
+                from: authId,
+                to: target,
+                timeout: setTimeout(() => closeChallenge(challengeId, "challenge_expired"), CHALLENGE_TTL_MS),
+            });
+
+            targetSocket.emit("challenge_received", {
+                challengeId,
+                from,
+                expiresInMs: CHALLENGE_TTL_MS,
+            });
+
+            reply({ ok: true, challengeId, expiresInMs: CHALLENGE_TTL_MS });
+        } catch (error) {
+            reply({ ok: false, error: error.message });
+        }
+    });
+
+    socket.on("challenge_cancel", (data) => {
+        const challenge = challenges.get(data?.challengeId);
+        if (!challenge || challenge.from !== socket.data.authId) return;
+
+        closeChallenge(data.challengeId, "challenge_cancelled");
+    });
+
+    socket.on("challenge_response", async (data, ack) => {
+        const reply = (payload) => {
+            if (typeof ack === "function") ack(payload);
+        };
+
+        try {
+            const authId = socket.data.authId;
+            const challengeId = data?.challengeId;
+            const challenge = challenges.get(challengeId);
+
+            if (!authId || !challenge || challenge.to !== authId) throw new Error("CHALLENGE_NOT_FOUND");
+
+            clearTimeout(challenge.timeout);
+            challenges.delete(challengeId);
+
+            if (!data?.accept) {
+                const by = await loadPublicProfile(authId);
+                emitToUser(challenge.from, "challenge_declined", { challengeId, by });
+                return reply({ ok: true });
+            }
+
+            const challengerSocketId = authenticatedUsers.get(challenge.from);
+            const challengerSocket = challengerSocketId ? io.sockets.sockets.get(challengerSocketId) : null;
+
+            if (!challengerSocket) throw new Error("TARGET_OFFLINE");
+            if (authIdToRoom.has(challenge.from) || authIdToRoom.has(authId)) throw new Error("TARGET_BUSY");
+
+            const [challenger, me] = await Promise.all([
+                loadPublicProfile(challenge.from),
+                loadPublicProfile(authId),
+            ]);
+
+            if (!challenger || !me) throw new Error("PROFILE_NOT_FOUND");
+
+            // Nobody should also be matched with a stranger at the same time.
+            removeFromQueue(challengerSocket.id);
+            removeFromQueue(socket.id);
+
+            const asPlayer = (profile, socketId, order) => ({
+                id: socketId,
+                authId: profile.id,
+                name: profile.username,
+                avatar: profile.avatar || "",
+                rating: Number.isFinite(profile.rating) ? profile.rating : DEFAULT_RATING,
+                joinedAt: order,
+            });
+
+            // Colours are drawn at random.
+            const challengerFirst = Math.random() < 0.5;
+
+            startPvPGame(
+                asPlayer(challenger, challengerSocket.id, challengerFirst ? 0 : 1),
+                asPlayer(me, socket.id, challengerFirst ? 1 : 0),
+                { friendly: true, challenge: true }
+            );
+
+            reply({ ok: true });
+        } catch (error) {
+            reply({ ok: false, error: error.message });
+        }
     });
 
     socket.on("find_match", async (data) => {
@@ -1545,6 +1798,7 @@ io.on("connection", (socket) => {
         newGame.names.b = info.names.w;
         newGame.avatars.w = info.avatars.b;
         newGame.avatars.b = info.avatars.w;
+        newGame.friendly = Boolean(info.friendly);
 
         oldWhiteSocket.join(newRoomId);
         oldBlackSocket.join(newRoomId);
@@ -1598,6 +1852,14 @@ io.on("connection", (socket) => {
 
         removeFromQueue(socket.id);
         rateBuckets.delete(socket.id);
+
+        if (authId) {
+            for (const [id, challenge] of challenges) {
+                if (challenge.from === authId || challenge.to === authId) {
+                    closeChallenge(id, "challenge_cancelled");
+                }
+            }
+        }
 
         const roomId = socketToRoom.get(socket.id);
         if (!roomId) return;

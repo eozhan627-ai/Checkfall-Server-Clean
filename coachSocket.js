@@ -1,3 +1,4 @@
+import { Chess } from "chess.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
 
 const DAILY_LIMIT = { silver: 5, gold: 20, diamond: 200 };
@@ -5,6 +6,59 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const MODEL = "claude-haiku-4-5-20251001";
 
 const COACH_NAME = "Uhu"; // NEU: hier den Namen des Maskottchens aendern, falls gewuenscht
+
+// Position before a move, so the coach can talk about concrete squares.
+function fenBeforeMove(pgn, index) {
+    try {
+        const source = new Chess();
+        source.loadPgn(pgn);
+        const history = source.history({ verbose: true });
+
+        const replay = new Chess();
+        for (let i = 0; i < index && i < history.length; i++) {
+            replay.move({ from: history[i].from, to: history[i].to, promotion: history[i].promotion });
+        }
+        return replay.fen();
+    } catch {
+        return null;
+    }
+}
+
+// Everything the review knows about the move, as plain text for the model.
+function describeMoveForCoach({ move, game, index }) {
+    const side = move.color === "b" || index % 2 === 1 ? "Black" : "White";
+    const playerColor = game.analysis?.playerColor;
+    const lines = [];
+
+    lines.push(`Move ${move.moveNumber} by ${side}: ${move.san}. The review labels it "${move.classification}".`);
+
+    if (playerColor) {
+        lines.push(`The user played ${playerColor === "w" ? "White" : "Black"}.`);
+    }
+
+    const fen = fenBeforeMove(game.pgn, index);
+    if (fen) lines.push(`Position before the move (FEN): ${fen}`);
+
+    if (typeof move.mate === "number" && move.mateFor) {
+        lines.push(
+            move.mate === 0
+                ? "The move is checkmate."
+                : `After the move ${move.mateFor === "w" ? "White" : "Black"} has a forced mate in ${move.mate}.`
+        );
+    } else {
+        lines.push(`Evaluation after the move: ${move.evalCp} centipawns (positive = advantage for White).`);
+    }
+
+    if (move.bestSan && move.bestSan !== move.san) {
+        lines.push(`Engine's best move was ${move.bestSan}${move.bestLine?.length > 1 ? `, best line: ${move.bestLine.join(" ")}` : ""}.`);
+    }
+
+    if (move.reply?.length) {
+        lines.push(`Best continuation after the move played: ${move.reply.join(" ")}.`);
+    }
+
+    return lines.join("\n");
+}
 
 export function setupCoachHandlers(io) {
     io.on("connection", (socket) => {
@@ -51,13 +105,14 @@ export function setupCoachHandlers(io) {
                 const move = typeof moveIndex === "number" && moveIndex > 0 ? moves[moveIndex - 1] : null;
 
                 const contextText = move
-                    ? `Move ${move.moveNumber} (${move.san}), classification "${move.classification}", evaluation after the move: ${move.evalCp} centipawns (positive = advantage for White).`
+                    ? describeMoveForCoach({ move, game, index: moveIndex - 1 })
                     : `General question about the game. PGN: ${game.pgn}`;
 
                 const systemPrompt =
                     `You are ${COACH_NAME}, a friendly, encouraging chess coach in the app POVCheck. ` +
                     "Explain chess moves clearly for hobby players, concretely and briefly (max. 4 sentences), " +
-                    "without too much jargon. Be encouraging, even about mistakes. Always answer in English.";
+                    "without too much jargon. Be encouraging, even about mistakes. Always answer in English. " +
+                    "Rely on the engine information you are given and do not invent moves or evaluations.";
 
                 const response = await fetch("https://api.anthropic.com/v1/messages", {
                     method: "POST",

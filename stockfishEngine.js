@@ -1,24 +1,22 @@
 import { spawn } from "child_process";
-import os from "os";
 
-const STOCKFISH_PATH = "/usr/games/stockfish";
+// Path of the Stockfish binary. The Docker image installs it to
+// /usr/games/stockfish; override with STOCKFISH_PATH for local testing.
+const STOCKFISH_PATH = process.env.STOCKFISH_PATH || "/usr/games/stockfish";
 
-// GEÄNDERT: Threads/Hash konfigurierbar, Defaults bewusst NIEDRIG gewählt.
-// Ohne diese Optionen läuft Stockfish mit 1 Thread und 16MB Hash - das
-// macht jede einzelne Suche langsam. Aber: zu hohe Werte (z.B. Threads=2
-// pro Engine bei 6 parallelen Engines = 12 angeforderte Threads) überlasten
-// auf kleinen Hosting-Plänen (Render etc.) die CPU beim gleichzeitigen
-// Start, was zu STOCKFISH_INIT_TIMEOUT führt. Lieber konservativ starten
-// und über die Env-Variablen gezielt an den tatsächlichen Plan anpassen.
+// Threads/Hash deliberately LOW by default. Too high values (e.g. Threads=2
+// per engine with several engines in parallel) overload small hosting plans
+// during start-up. Tune via env variables for the plan actually in use.
 const ENGINE_THREADS = Number(process.env.STOCKFISH_THREADS) || 1;
 const ENGINE_HASH_MB = Number(process.env.STOCKFISH_HASH_MB) || 32;
-// NEU: Timeout großzügiger, weil unter CPU-Last (z.B. mehrere Engines
-// starten gleichzeitig) der uciok/readyok-Handshake einfach länger dauern
-// kann, ohne dass etwas kaputt ist.
 const ENGINE_INIT_TIMEOUT_MS = Number(process.env.STOCKFISH_INIT_TIMEOUT_MS) || 15000;
-// NEU: harte Zeit-Obergrenze pro Zug, als Sicherheitsnetz gegen ausufernde
-// Suchzeiten bei Tiefe 20 auf schwacher/überlasteter CPU.
-const ENGINE_MAX_MOVE_TIME_MS = Number(process.env.STOCKFISH_MAX_MOVE_TIME_MS) || 3000;
+
+// Number of engines working on one analysis at the same time.
+const DEFAULT_POOL_SIZE = Number(process.env.STOCKFISH_POOL_SIZE) || 2;
+
+export function getPoolSize() {
+    return DEFAULT_POOL_SIZE;
+}
 
 export function createAnalysisEngine() {
     return new Promise((resolve, reject) => {
@@ -30,7 +28,7 @@ export function createAnalysisEngine() {
         const timeout = setTimeout(() => {
             if (!settled) {
                 settled = true;
-                engine.kill(); // NEU: hängenden Prozess nicht als Zombie zurücklassen
+                engine.kill(); // do not leave a hanging process behind
                 reject(new Error("STOCKFISH_INIT_TIMEOUT"));
             }
         }, ENGINE_INIT_TIMEOUT_MS);
@@ -43,7 +41,7 @@ export function createAnalysisEngine() {
             }
         });
 
-        engine.stdout.on("data", (data) => {
+        const onData = (data) => {
             buffer += data.toString();
             const lines = buffer.split("\n");
             buffer = lines.pop();
@@ -53,9 +51,9 @@ export function createAnalysisEngine() {
 
                 if (trimmed === "uciok" && !uciReady) {
                     uciReady = true;
-                    engine.stdin.write(`setoption name MultiPV value 2\n`);
-                    // NEU: Threads/Hash - der größte Hebel für die Geschwindigkeit
-                    // einer EINZELNEN Suche.
+                    // Two lines: the second one tells us whether the best
+                    // move was the ONLY good move ("great move").
+                    engine.stdin.write("setoption name MultiPV value 2\n");
                     engine.stdin.write(`setoption name Threads value ${ENGINE_THREADS}\n`);
                     engine.stdin.write(`setoption name Hash value ${ENGINE_HASH_MB}\n`);
                     engine.stdin.write("isready\n");
@@ -64,63 +62,121 @@ export function createAnalysisEngine() {
                 if (trimmed === "readyok" && !settled) {
                     settled = true;
                     clearTimeout(timeout);
-                    resolve(engine);
-                }
-            }
-        });
-
-        engine.stdin.write("uci\n");
-    });
-}
-
-export function evaluatePosition(engine, fen, depth) {
-    return new Promise((resolve) => {
-        const scores = {};
-        let bestMove = null;
-        let buffer = "";
-
-        const onData = (data) => {
-            buffer += data.toString();
-            const lines = buffer.split("\n");
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                const mpvMatch = line.match(/multipv (\d+)/);
-                const scoreMatch = line.match(/score (cp|mate) (-?\d+)/);
-
-                if (mpvMatch && scoreMatch) {
-                    const idx = parseInt(mpvMatch[1], 10);
-                    const [, type, value] = scoreMatch;
-                    scores[idx] =
-                        type === "mate"
-                            ? Number(value) > 0 ? 10000 : -10000
-                            : Number(value);
-                }
-
-                if (line.startsWith("bestmove")) {
-                    bestMove = line.split(" ")[1];
                     engine.stdout.off("data", onData);
-                    resolve({
-                        evalCp: scores[1] ?? null,
-                        secondEvalCp: scores[2] ?? null,
-                        bestMove,
-                    });
-                    return;
+                    resolve(engine);
                 }
             }
         };
 
         engine.stdout.on("data", onData);
+        engine.stdin.write("uci\n");
+    });
+}
+
+function parseScore(type, value) {
+    const number = Number(value);
+    return type === "mate" ? { cp: null, mate: number } : { cp: number, mate: null };
+}
+
+/**
+ * Evaluates one position.
+ *
+ * @param {import("child_process").ChildProcess} engine
+ * @param {string} fen
+ * @param {{ depth: number, movetime: number }} limits the search stops at
+ *        whichever limit is reached first
+ * @returns {Promise<{cp:number|null, mate:number|null, second:{cp:number|null,mate:number|null}|null, bestMove:string|null, pv:string[], depth:number}>}
+ *          scores are from the point of view of the side to move
+ */
+export function evaluatePosition(engine, fen, limits) {
+    return new Promise((resolve) => {
+        const lines = {}; // multipv index -> { score, pv, depth }
+        let buffer = "";
+        let finished = false;
+
+        const finish = (bestMove) => {
+            if (finished) return;
+            finished = true;
+
+            clearTimeout(safety);
+            engine.stdout.off("data", onData);
+
+            const first = lines[1] ?? null;
+            const second = lines[2] ?? null;
+
+            resolve({
+                cp: first?.score.cp ?? null,
+                mate: first?.score.mate ?? null,
+                second: second ? second.score : null,
+                bestMove: bestMove && bestMove !== "(none)" ? bestMove : first?.pv[0] ?? null,
+                pv: first?.pv ?? [],
+                depth: first?.depth ?? 0,
+            });
+        };
+
+        // Output that still belongs to an earlier search (e.g. one that was
+        // cut off) is ignored until the engine confirms it is ready.
+        let synced = false;
+
+        const onData = (data) => {
+            buffer += data.toString();
+            const chunks = buffer.split("\n");
+            buffer = chunks.pop();
+
+            for (const raw of chunks) {
+                const line = raw.trim();
+
+                if (!synced) {
+                    if (line === "readyok") {
+                        synced = true;
+                        engine.stdin.write(`go depth ${limits.depth} movetime ${limits.movetime}\n`);
+                    }
+                    continue;
+                }
+
+                if (line.startsWith("info") && line.includes(" pv ")) {
+                    // Bound-only updates are not a real evaluation yet.
+                    if (line.includes("lowerbound") || line.includes("upperbound")) continue;
+
+                    const mpv = line.match(/ multipv (\d+)/);
+                    const score = line.match(/ score (cp|mate) (-?\d+)/);
+                    const depth = line.match(/ depth (\d+)/);
+                    const pv = line.match(/ pv (.+)$/);
+
+                    if (score && pv) {
+                        const index = mpv ? parseInt(mpv[1], 10) : 1;
+
+                        lines[index] = {
+                            score: parseScore(score[1], score[2]),
+                            pv: pv[1].trim().split(/\s+/),
+                            depth: depth ? parseInt(depth[1], 10) : 0,
+                        };
+                    }
+                    continue;
+                }
+
+                if (line.startsWith("bestmove")) {
+                    finish(line.split(" ")[1]);
+                    return;
+                }
+            }
+        };
+
+        // If the engine never answers (crashed, killed), do not hang the
+        // whole analysis - continue with whatever was reported so far.
+        const safety = setTimeout(() => {
+            try {
+                engine.stdin.write("stop\n");
+            } catch {
+                // engine is gone - nothing to stop
+            }
+            finish(null);
+        }, limits.movetime + 8000);
+
+        engine.stdout.on("data", onData);
 
         engine.stdin.write(`position fen ${fen}\n`);
-        // NEU: movetime als harte Obergrenze zusätzlich zur Tiefe.
-        // Falls Tiefe X auf dieser Maschine ungewöhnlich lange braucht
-        // (langsame CPU, schlecht optimiertes Binary, o.ä.), bricht die
-        // Suche trotzdem nach spätestens ENGINE_MAX_MOVE_TIME_MS ab, statt
-        // dass ein einzelner Zug die gesamte Analyse in die Länge zieht.
-        // "go depth X movetime Y" -> Stockfish stoppt, sobald die ERSTE
-        // der beiden Grenzen erreicht ist.
-        engine.stdin.write(`go depth ${depth} movetime ${ENGINE_MAX_MOVE_TIME_MS}\n`);
+        engine.stdin.write("isready\n");
     });
 }
 
@@ -133,21 +189,11 @@ export function closeEngine(engine) {
     }
 }
 
-// GEÄNDERT: Poolgröße NICHT mehr von os.cpus() ableiten. Auf Render/in
-// Containern liefert os.cpus() oft die Kernzahl der Host-Maschine, nicht
-// das tatsächliche CPU-Kontingent des Containers - das führte dazu, dass
-// der Pool viel zu groß gewählt wurde (z.B. 6 Engines à 2 Threads auf
-// einem 0.5-vCPU-Plan) und die Engines sich beim Start gegenseitig die
-// CPU wegnahmen -> STOCKFISH_INIT_TIMEOUT. Fester, konfigurierbarer
-// Default stattdessen - an den tatsächlichen Hosting-Plan anpassen.
-const DEFAULT_POOL_SIZE = Number(process.env.STOCKFISH_POOL_SIZE) || 2;
-
 export async function createEnginePool(size) {
     const poolSize = size || DEFAULT_POOL_SIZE;
 
-    // NEU: Engines leicht gestaffelt starten statt alle im selben Tick.
-    // Das entzerrt die CPU-Spitze beim uci-Handshake, die auf kleinen
-    // Instanzen sonst mehrere Engines gleichzeitig ausbremst.
+    // Start engines slightly staggered instead of all in the same tick -
+    // that flattens the CPU peak of the uci handshake on small instances.
     const settled = [];
     for (let i = 0; i < poolSize; i++) {
         settled.push(
@@ -155,7 +201,7 @@ export async function createEnginePool(size) {
                 .then((engine) => ({ status: "fulfilled", value: engine }))
                 .catch((error) => ({ status: "rejected", reason: error }))
         );
-        if (i < poolSize - 1) await new Promise((r) => setTimeout(r, 250));
+        if (i < poolSize - 1) await new Promise((r) => setTimeout(r, 150));
     }
     const results = await Promise.all(settled);
 
@@ -163,12 +209,10 @@ export async function createEnginePool(size) {
     const failures = results.filter((r) => r.status === "rejected");
 
     if (failures.length > 0) {
-        console.log(`ENGINE POOL: ${failures.length}/${poolSize} Engine(s) beim Start fehlgeschlagen`);
+        console.log(`ENGINE POOL: ${failures.length}/${poolSize} engine(s) failed to start`);
     }
 
-    // NEU: Nicht alles abbrechen, nur weil EINE Engine nicht rechtzeitig
-    // hochkam - mit den übrigen weiterarbeiten. Nur wenn wirklich keine
-    // einzige Engine bereit ist, ist die Analyse tatsächlich unmöglich.
+    // One engine failing is no reason to give up - work with the rest.
     if (engines.length === 0) {
         throw new Error("STOCKFISH_POOL_INIT_FAILED");
     }
@@ -180,28 +224,49 @@ export function closeEnginePool(engines) {
     for (const engine of engines) closeEngine(engine);
 }
 
-// NEU: Verteilt eine Liste von Aufgaben (hier: FEN + Tiefe) auf einen
-// Engine-Pool. Jede Engine arbeitet ihre eigene Warteschlange ab, sodass
-// alle parallel rechnen statt eine nach der anderen. Ergebnisse werden
-// an der ursprünglichen Position im Array abgelegt, die Reihenfolge bleibt
-// also erhalten, obwohl die Fertigstellung unsortiert reinkommt.
-export async function evaluatePositionsInParallel(engines, tasks, onEach) {
+/**
+ * Evaluates many positions on a pool of engines.
+ *
+ * Each engine gets one CONTIGUOUS part of the game and walks through it in
+ * order. Consecutive positions share most of their search tree, so the
+ * engine's hash table from the previous position speeds up the next one -
+ * noticeably faster than handing positions out round-robin.
+ *
+ * @param {Array} engines
+ * @param {Array<{ fen: string, depth: number, movetime: number, skip?: object }>} tasks
+ *        a task with `skip` is not sent to the engine; `skip` is its result
+ * @param {{ onStart?: (index:number, engineIndex:number)=>void, onResult?: (index:number, result:object, done:number, total:number)=>void }} hooks
+ */
+export async function evaluatePositionsInParallel(engines, tasks, hooks = {}) {
     const results = new Array(tasks.length);
-    let nextIndex = 0;
     let completed = 0;
 
-    async function worker(engine) {
-        while (true) {
-            const index = nextIndex++;
-            if (index >= tasks.length) return;
-            const { fen, depth } = tasks[index];
-            const result = await evaluatePosition(engine, fen, depth);
+    const chunkSize = Math.ceil(tasks.length / engines.length);
+
+    async function worker(engine, engineIndex) {
+        const start = engineIndex * chunkSize;
+        const end = Math.min(tasks.length, start + chunkSize);
+
+        for (let index = start; index < end; index++) {
+            const task = tasks[index];
+            let result;
+
+            if (task.skip) {
+                result = task.skip;
+            } else {
+                hooks.onStart?.(index, engineIndex);
+                result = await evaluatePosition(engine, task.fen, {
+                    depth: task.depth,
+                    movetime: task.movetime,
+                });
+            }
+
             results[index] = result;
             completed += 1;
-            if (onEach) onEach(completed, tasks.length);
+            hooks.onResult?.(index, result, completed, tasks.length);
         }
     }
 
-    await Promise.all(engines.map((engine) => worker(engine)));
+    await Promise.all(engines.map((engine, engineIndex) => worker(engine, engineIndex)));
     return results;
 }
