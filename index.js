@@ -26,6 +26,7 @@ import {
     thinkTimeMs,
 } from "./housePlayer.js";
 import { setupVipRoutes } from "./vipSubscriptions.js";
+import { saveReport, setupFeedbackRoutes } from "./feedback.js";
 import { calculateGameRatings } from "./elo.js";
 
 
@@ -587,6 +588,8 @@ function cleanupRoom(roomId) {
             friendly: Boolean(g.friendly),
             timeControl: g.timeControl,
             house: g.house ? { id: g.house.id, color: g.house.color } : null,
+            // Kept for a report about this game.
+            pgn: g.game.pgn(),
             endedAt: Date.now(),
         });
 
@@ -1223,6 +1226,9 @@ app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
 
 // VIP subscriptions: /vip/sync and /revenuecat/webhook
 setupVipRoutes(app, { getAuthIdFromRequest });
+
+// Support form and error reports of the app: /support and /client-error
+setupFeedbackRoutes(app, { getAuthIdFromRequest });
 
 app.post("/set-initial-rating", async (req, res) => {
     try {
@@ -1940,6 +1946,42 @@ io.on("connection", (socket) => {
             const opponent = socket.id === g.players.w ? g.players.b : g.players.w;
             io.to(opponent).emit("draw_declined");
         }
+    });
+
+    // Report the opponent of a running or just finished game. Who the
+    // opponent was is taken from the game here, not from the app.
+    socket.on("report_player", async ({ roomId, reason, details } = {}, ack) => {
+        const reply = typeof ack === "function" ? ack : () => {};
+        const authId = socket.data.authId;
+
+        if (!authId) return reply({ ok: false, error: "SIGN_IN_REQUIRED" });
+        if (!isNonEmptyString(roomId, 200)) return reply({ ok: false, error: "GAME_NOT_FOUND" });
+
+        const running = games.get(roomId);
+        const source = running ?? finishedGames.get(roomId);
+
+        if (!source) return reply({ ok: false, error: "GAME_NOT_FOUND" });
+
+        const color = source.authIds.w === authId ? "w" : source.authIds.b === authId ? "b" : null;
+
+        if (!color) return reply({ ok: false, error: "GAME_NOT_FOUND" });
+
+        const other = color === "w" ? "b" : "w";
+
+        const result = await saveReport(
+            {
+                reporterId: authId,
+                reportedId: source.authIds[other],
+                reportedName: source.names[other],
+                roomId,
+                pgn: running ? running.game.pgn() : source.pgn,
+                computerOpponent: Boolean(source.house),
+            },
+            { reason, details }
+        );
+
+        // The app only learns whether it worked.
+        reply({ ok: result.ok, error: result.ok ? undefined : result.error });
     });
 
     socket.on("resign_game", ({ roomId } = {}) => {
