@@ -11,6 +11,21 @@ import { setupCoachHandlers } from "./coachSocket.js"; // NEU
 import { setupCoachProfileHandlers } from "./coachProfileSocket.js"; // NEU
 import { setupAnalysisHandlers } from "./stockfishSocket.js"; // NEU
 import { supabaseAdmin } from "./supabaseAdmin.js";
+import { chooseWeightedMove, computeEloProfile, WEAK_MODE_MULTIPV } from "./botStrength.js";
+import { pickOpponent } from "./matchmakingRules.js";
+import { createHouseEngine } from "./houseEngine.js";
+import {
+    LOST_SCORE_CP,
+    REMATCH_ACCEPT_CHANCE,
+    acceptsDraw,
+    houseId,
+    houseName,
+    houseRating,
+    houseWaitMs,
+    resigns,
+    thinkTimeMs,
+} from "./housePlayer.js";
+import { setupVipRoutes } from "./vipSubscriptions.js";
 import { calculateGameRatings } from "./elo.js";
 
 
@@ -39,6 +54,12 @@ const ALLOWED_INITIAL_RATINGS = [400, 700, 1000, 1500, 2000];
 
 const DEFAULT_RATING = 1000;
 const MAX_GUEST_RATING = 3200;
+
+// Computer opponents in matchmaking (see housePlayer.js). Each one runs its
+// own engine process, so the number of such games at the same time is capped.
+// HOUSE_PLAYERS=off switches them off completely.
+const HOUSE_ENABLED = process.env.HOUSE_PLAYERS !== "off";
+const HOUSE_MAX_GAMES = Number(process.env.HOUSE_MAX_GAMES) || 6;
 
 // CORS for the HTTP endpoints (the web build sends an Authorization header,
 // which triggers a preflight request).
@@ -291,87 +312,9 @@ function createPvPGame(timeControl = DEFAULT_TIME_CONTROL) {
         avatars: { w: null, b: null },
         // Challenge between friends / clan mates: does not count for the rating.
         friendly: false,
+        // Set when one side is a computer opponent (see startPvPGame).
+        house: null,
     };
-}
-
-// =============================
-// BOT-STÄRKE / ELO-KALIBRIERUNG
-// =============================
-
-// Der Slider im Client geht 0 (bzw. 100) bis 3200. Ab 3200 spielt die Engine
-// mit voller Stärke (kein UCI_LimitStrength).
-const ELO_MIN = 0;
-const ELO_MAX = 3200;
-
-// Native Grenzen, in denen Stockfish selbst über UCI_Elo kalibriert - hängt
-// von der Engine-Version ab! Beim Start wird geloggt, was deine Binary
-// tatsächlich als min/max für UCI_Elo meldet (siehe "option name UCI_Elo"
-// im Log) - diese beiden Werte ggf. daran anpassen.
-const ENGINE_ELO_MIN = 1320;
-const ENGINE_ELO_MAX = 3190;
-
-// Wie viele Kandidatenzüge wir uns von der Engine geben lassen, um daraus
-// im "weak mode" (Ziel-Elo unter ENGINE_ELO_MIN) gewichtet einen auszuwählen
-// statt immer stur den Top-Zug zu spielen.
-const WEAK_MODE_MULTIPV = 8;
-
-function computeEloProfile(rawElo) {
-    const n = Number(rawElo);
-    const targetElo = Number.isFinite(n)
-        ? Math.min(ELO_MAX, Math.max(ELO_MIN, Math.round(n)))
-        : 300;
-
-    const fullStrength = targetElo >= ELO_MAX;
-    const engineElo = Math.min(ENGINE_ELO_MAX, Math.max(ENGINE_ELO_MIN, targetElo));
-
-    // 0 = an der nativen Engine-Untergrenze, 1 = ganz unten (Elo 0).
-    // Steuert, wie stark wir zusätzlich zu UCI_Elo künstlich "Patzer"
-    // einstreuen (die Engine selbst spielt unterhalb ihrer eigenen
-    // UCI_Elo-Untergrenze i.d.R. nicht mehr spürbar schwächer).
-    const belowFloorRatio =
-        targetElo >= ENGINE_ELO_MIN
-            ? 0
-            : (ENGINE_ELO_MIN - targetElo) / ENGINE_ELO_MIN;
-
-    return {
-        targetElo,
-        fullStrength,
-        engineElo,
-        belowFloorRatio,
-        weakMode: belowFloorRatio > 0,
-    };
-}
-
-// Wählt aus den (bereits nach cp absteigend sortierten) Kandidatenzügen
-// gewichtet einen aus. Je höher belowFloorRatio, desto "flacher" die
-// Gewichtung (mehr Ungenauigkeiten) und desto größer die Chance auf einen
-// echten Patzer (schwächster der Kandidaten wird gespielt - z.B. eine
-// Figur, die dabei hängen bleibt).
-function chooseWeightedMove(candidates, belowFloorRatio) {
-    if (candidates.length === 0) return null;
-    if (candidates.length === 1) return candidates[0].uci;
-
-    const best = candidates[0].cp;
-
-    // Temperatur in "Centipawn": klein = fast immer bester Zug,
-    // groß = auch deutlich schwächere Kandidaten werden regelmäßig gespielt.
-    const temperature = 35 + belowFloorRatio * 220;
-
-    const blunderChance = belowFloorRatio * 0.16; // bis zu ~16% bei Elo 0
-    if (Math.random() < blunderChance) {
-        return candidates[candidates.length - 1].uci;
-    }
-
-    const weights = candidates.map((c) => Math.exp(-(best - c.cp) / temperature));
-    const total = weights.reduce((a, b) => a + b, 0);
-
-    let r = Math.random() * total;
-    for (let i = 0; i < candidates.length; i++) {
-        r -= weights[i];
-        if (r <= 0) return candidates[i].uci;
-    }
-
-    return candidates[candidates.length - 1].uci;
 }
 
 function createBotGame(rawElo = 300) {
@@ -394,50 +337,26 @@ function createBotGame(rawElo = 300) {
 }
 
 // =============================
-// MATCHMAKING RANGE
+// MATCHMAKING
 // =============================
-
-function getMatchRange(player) {
-    const waitedSeconds = (Date.now() - player.joinedAt) / 1000;
-
-    if (waitedSeconds < 5) return 100;
-    if (waitedSeconds < 10) return 150;
-    if (waitedSeconds < 15) return 250;
-    if (waitedSeconds < 20) return 400;
-
-    return 600;
-}
+// The pairing rules (rating range) live in matchmakingRules.js. A player who
+// finds no human in range gets a computer opponent (housePlayer.js).
 
 function findMatchForPlayer(player) {
-    const playerRange = getMatchRange(player);
-
-    for (let i = 0; i < matchmakingQueue.length; i++) {
-        const opponent = matchmakingQueue[i];
-
-        if (opponent.id === player.id) continue;
-
-        // Only players who want the same time control are paired.
-        if (resolveTimeControl(opponent.timeControl) !== resolveTimeControl(player.timeControl)) continue;
-
-        const opponentSocket = io.sockets.sockets.get(opponent.id);
-
-        if (!opponentSocket) {
+    // Drop players whose connection is gone.
+    for (let i = matchmakingQueue.length - 1; i >= 0; i--) {
+        if (!io.sockets.sockets.get(matchmakingQueue[i].id)) {
             matchmakingQueue.splice(i, 1);
-            i--;
-            continue;
-        }
-
-        const eloDifference = Math.abs(player.rating - opponent.rating);
-        const opponentRange = getMatchRange(opponent);
-        const allowedRange = Math.min(playerRange, opponentRange);
-
-        if (eloDifference <= allowedRange) {
-            matchmakingQueue.splice(i, 1);
-            return opponent;
         }
     }
 
-    return null;
+    const opponent = pickOpponent(player, matchmakingQueue);
+
+    if (opponent) {
+        removeFromQueue(opponent.id);
+    }
+
+    return opponent;
 }
 
 function removeFromQueue(socketId) {
@@ -448,23 +367,35 @@ function removeFromQueue(socketId) {
 }
 
 setInterval(() => {
-    for (let i = 0; i < matchmakingQueue.length; i++) {
-        const player = matchmakingQueue[i];
-        const opponentSocket = io.sockets.sockets.get(player.id);
-        if (!opponentSocket) {
-            matchmakingQueue.splice(i, 1);
-            i--;
+    for (const player of [...matchmakingQueue]) {
+        // Paired earlier in this round.
+        if (!matchmakingQueue.includes(player)) continue;
+
+        const opponent = findMatchForPlayer(player);
+
+        if (opponent) {
+            removeFromQueue(player.id);
+            startPvPGame(player, opponent);
             continue;
         }
 
-        const opponent = findMatchForPlayer(player);
-        if (opponent) {
-            matchmakingQueue.splice(matchmakingQueue.indexOf(player), 1);
-            startPvPGame(player, opponent);
-            break;
-        }
+        if (!HOUSE_ENABLED || player.houseStarting) continue;
+        if (Date.now() - player.joinedAt < player.houseAfterMs) continue;
+
+        player.houseStarting = true;
+
+        launchHouseGame(player, newHouseOpponent(player), {
+            houseColor: Math.random() < 0.5 ? "w" : "b",
+            mustBeQueued: true,
+        }).then((started) => {
+            if (started) return;
+
+            // No engine free right now: keep looking for a human, try again later.
+            player.houseStarting = false;
+            player.houseAfterMs += 15_000;
+        });
     }
-}, 3000);
+}, 2000);
 
 // =============================
 // TIMER (PvP)
@@ -542,7 +473,6 @@ async function persistGameResult(authId, { rating, won }) {
                 rating,
                 games_played: (profile?.games_played ?? 0) + 1,
                 wins: (profile?.wins ?? 0) + (won ? 1 : 0),
-                updated_at: new Date().toISOString(),
             })
             .eq("id", authId);
 
@@ -563,7 +493,10 @@ function finishPvPGame(roomId, type, winnerColor) {
     // A game only counts for the rating when both players are logged in.
     // Guests send their own rating, so it cannot be trusted.
     // Friendly games (challenges) are never rated either.
-    const rated = Boolean(g.authIds.w && g.authIds.b) && !g.friendly;
+    // Against a computer opponent the game counts for the signed-in player.
+    const bothSignedIn = Boolean(g.authIds.w && g.authIds.b);
+    const signedInVsHouse = Boolean(g.house && (g.authIds.w || g.authIds.b));
+    const rated = (bothSignedIn || signedInVsHouse) && !g.friendly;
 
     const before = { w: g.ratings.w, b: g.ratings.b };
     const computed = calculateGameRatings(before, winnerColor);
@@ -643,8 +576,11 @@ function cleanupRoom(roomId) {
             avatars: { ...g.avatars },
             friendly: Boolean(g.friendly),
             timeControl: g.timeControl,
+            house: g.house ? { id: g.house.id, color: g.house.color } : null,
             endedAt: Date.now(),
         });
+
+        stopHouse(g);
     }
 
     games.delete(roomId);
@@ -842,8 +778,24 @@ function startPvPGame(playerA, playerB, options = {}) {
     const game = createPvPGame(options.timeControl ?? playerA.timeControl);
     game.friendly = Boolean(options.friendly);
 
-    const white = playerA.joinedAt <= playerB.joinedAt ? playerA : playerB;
+    // Whoever searched first is White - unless the caller decides.
+    const white = options.whiteId
+        ? (playerA.id === options.whiteId ? playerA : playerB)
+        : (playerA.joinedAt <= playerB.joinedAt ? playerA : playerB);
     const black = white === playerA ? playerB : playerA;
+
+    if (options.house) {
+        game.house = {
+            id: options.house.id,
+            color: white.id === options.house.id ? "w" : "b",
+            engine: options.house.engine,
+            rating: options.house.rating,
+            thinking: false,
+            timer: null,
+            lastScore: null, // engine's view of its own position, in centipawns
+            lostTurns: 0,
+        };
+    }
 
     game.players.w = white.id;
     game.players.b = black.id;
@@ -894,7 +846,250 @@ function startPvPGame(playerA, playerB, options = {}) {
         black: black.name,
         blackRating: black.rating,
         difference: Math.abs(white.rating - black.rating),
+        house: game.house ? game.house.color : null,
     });
+
+    scheduleHouseMove(roomId);
+}
+
+// =============================
+// MOVES (PvP)
+// =============================
+
+// Plays a move in a PvP game: board, clocks, events, end of game.
+// moverId is the socket id (or the computer opponent's id) of the mover.
+function applyPvPMove(roomId, g, move, moverId) {
+    let result;
+
+    try {
+        result = g.game.move(move);
+    } catch (error) {
+        return null;
+    }
+
+    if (!result) return null;
+
+    const now = Date.now();
+    const diff = Math.max(0, now - g.lastTick);
+
+    if (g.activeColor === "w") {
+        g.whiteTime -= diff;
+        g.whiteTime += g.increment;
+    } else {
+        g.blackTime -= diff;
+        g.blackTime += g.increment;
+    }
+
+    g.lastTick = now;
+    g.activeColor = g.activeColor === "w" ? "b" : "w";
+
+    io.to(roomId).except(moverId).emit("opponent_move", {
+        from: result.from,
+        to: result.to,
+        promotion: result.promotion,
+    });
+
+    io.to(roomId).emit("timer_update", {
+        whiteTime: g.whiteTime,
+        blackTime: g.blackTime,
+        activeColor: g.activeColor,
+    });
+
+    if (g.game.isGameOver()) {
+        if (g.game.isCheckmate()) {
+            // The side to move is the one that got mated.
+            finishPvPGame(roomId, "checkmate", g.game.turn() === "w" ? "b" : "w");
+        } else {
+            finishPvPGame(roomId, "draw", null);
+        }
+    } else {
+        scheduleHouseMove(roomId);
+    }
+
+    return result;
+}
+
+// =============================
+// COMPUTER OPPONENTS (see housePlayer.js)
+// =============================
+
+function countHouseGames() {
+    let count = 0;
+    for (const g of games.values()) {
+        if (g.house) count++;
+    }
+    return count;
+}
+
+function newHouseOpponent(player) {
+    return {
+        id: houseId(),
+        authId: null,
+        name: houseName(),
+        avatar: "",
+        rating: houseRating(player.rating),
+    };
+}
+
+function stopHouse(g) {
+    if (!g.house) return;
+
+    clearTimeout(g.house.timer);
+    g.house.engine?.quit();
+    g.house.engine = null;
+}
+
+// Starts a game between a human and a computer opponent.
+// Resolves with false when that is not possible (any more).
+async function launchHouseGame(human, house, { houseColor, mustBeQueued = false } = {}) {
+    if (!HOUSE_ENABLED || countHouseGames() >= HOUSE_MAX_GAMES) return false;
+
+    let engine;
+
+    try {
+        engine = await createHouseEngine(house.rating);
+    } catch (error) {
+        console.log("HOUSE ENGINE ERROR:", error?.message);
+        return false;
+    }
+
+    // The engine took a moment to start - the player may have found a human,
+    // cancelled or left in the meantime.
+    const stillWaiting = !mustBeQueued || matchmakingQueue.includes(human);
+    const inGame = socketToRoom.has(human.id) && games.has(socketToRoom.get(human.id));
+
+    if (!stillWaiting || inGame || !io.sockets.sockets.get(human.id)) {
+        engine.quit();
+        return false;
+    }
+
+    removeFromQueue(human.id);
+
+    startPvPGame(human, house, {
+        whiteId: houseColor === "w" ? house.id : human.id,
+        house: { id: house.id, engine, rating: house.rating },
+    });
+
+    return true;
+}
+
+// Lets the computer opponent make its move when it is its turn: the engine
+// picks the move, the move is played after a human-like thinking time.
+function scheduleHouseMove(roomId) {
+    const g = games.get(roomId);
+    if (!g || !g.house || g.finished) return;
+
+    const house = g.house;
+
+    if (house.thinking || !house.engine) return;
+    if (g.game.turn() !== house.color) return;
+
+    house.thinking = true;
+
+    const startedAt = Date.now();
+    const fen = g.game.fen();
+    const history = g.game.history({ verbose: true });
+    const legalMoves = g.game.moves();
+
+    const think = thinkTimeMs({
+        ply: history.length,
+        remainingMs: house.color === "w" ? g.whiteTime : g.blackTime,
+        baseMs: TIME_CONTROLS[g.timeControl].baseMs,
+        incrementMs: g.increment,
+        legalMoves: legalMoves.length,
+        recapture: Boolean(history.at(-1)?.captured),
+        inCheck: g.game.inCheck(),
+    });
+
+    const stillThisPosition = () => games.get(roomId) === g && !g.finished && g.game.fen() === fen;
+
+    house.engine
+        .search(fen, Math.min(800, Math.max(120, think * 0.5)))
+        .catch(() => null)
+        .then((found) => {
+            if (!stillThisPosition()) return;
+
+            house.timer = setTimeout(() => {
+                house.thinking = false;
+                if (!stillThisPosition()) return;
+
+                if (Number.isFinite(found?.scoreCp)) {
+                    house.lastScore = found.scoreCp;
+                    house.lostTurns = found.scoreCp <= LOST_SCORE_CP ? house.lostTurns + 1 : 0;
+                }
+
+                if (resigns({ rating: house.rating, lostTurns: house.lostTurns, ply: history.length })) {
+                    finishPvPGame(roomId, "resign", house.color === "w" ? "b" : "w");
+                    return;
+                }
+
+                const uci = found?.uci;
+                const move = uci
+                    ? { from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] }
+                    : null;
+
+                // Engine gone or move not usable: any legal move keeps the game going.
+                if (!move || !applyPvPMove(roomId, g, move, house.id)) {
+                    const fallback = legalMoves[Math.floor(Math.random() * legalMoves.length)];
+                    applyPvPMove(roomId, g, fallback, house.id);
+                }
+            }, Math.max(0, think - (Date.now() - startedAt)));
+        });
+}
+
+// Answer to a draw offer, after a short pause.
+function answerHouseDraw(roomId, g, offererId) {
+    setTimeout(() => {
+        if (games.get(roomId) !== g || g.finished) return;
+        if (g.drawOfferedBy !== offererId) return;
+
+        g.drawOfferedBy = null;
+
+        if (acceptsDraw({ scoreCp: g.house.lastScore, ply: g.game.history().length })) {
+            finishPvPGame(roomId, "draw", null);
+        } else {
+            io.to(offererId).emit("draw_declined");
+        }
+    }, 1500 + Math.random() * 3000);
+}
+
+// Answer to a rematch request: sometimes yes (colours swapped), sometimes no.
+function answerHouseRematch(roomId, info, socket) {
+    setTimeout(async () => {
+        if (finishedGames.get(roomId) !== info || !socket.connected) return;
+
+        const humanColor = info.house.color === "w" ? "b" : "w";
+        let started = false;
+
+        if (Math.random() < REMATCH_ACCEPT_CHANCE) {
+            finishedGames.delete(roomId);
+
+            started = await launchHouseGame(
+                {
+                    id: socket.id,
+                    authId: info.authIds[humanColor],
+                    name: info.names[humanColor],
+                    avatar: info.avatars[humanColor],
+                    rating: info.ratings[humanColor],
+                    timeControl: info.timeControl,
+                    joinedAt: Date.now(),
+                },
+                {
+                    id: info.house.id,
+                    authId: null,
+                    name: info.names[info.house.color],
+                    avatar: "",
+                    rating: info.ratings[info.house.color],
+                },
+                { houseColor: humanColor }
+            );
+        }
+
+        if (!started) {
+            finishedGames.delete(roomId);
+            socket.emit("rematch_declined");
+        }
+    }, 2000 + Math.random() * 4000);
 }
 
 // Simulierte Bedenkzeit: kurz & gleichmäßig in der Eröffnung, danach
@@ -996,7 +1191,7 @@ app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
 
         const { error: profileError } = await supabaseAdmin
             .from("profiles")
-            .update({ avatar: result.secure_url, updated_at: new Date().toISOString() })
+            .update({ avatar: result.secure_url })
             .eq("id", authId);
 
         if (profileError) {
@@ -1015,6 +1210,9 @@ app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
 // =============================
 // Only allowed while the player has not finished a rated game yet, and only
 // with one of the fixed start values.
+
+// VIP subscriptions: /vip/sync and /revenuecat/webhook
+setupVipRoutes(app, { getAuthIdFromRequest });
 
 app.post("/set-initial-rating", async (req, res) => {
     try {
@@ -1048,7 +1246,7 @@ app.post("/set-initial-rating", async (req, res) => {
 
         const { error } = await supabaseAdmin
             .from("profiles")
-            .update({ rating, updated_at: new Date().toISOString() })
+            .update({ rating })
             .eq("id", authId);
 
         if (error) throw error;
@@ -1431,6 +1629,11 @@ io.on("connection", (socket) => {
     });
 
     socket.on("find_match", async (data) => {
+        // The newest request counts: a search that is cancelled while the
+        // profile is still loading must not put the player into the queue.
+        socket.data.wantsMatch = true;
+        socket.data.matchRequest = data;
+
         if (socket.data.findingMatch) return;
 
         if (matchmakingQueue.some((p) => p.id === socket.id)) {
@@ -1475,8 +1678,10 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // The socket may have gone away or queued itself while we waited.
+            // The socket may have gone away, cancelled or queued itself
+            // while we waited.
             if (!socket.connected) return;
+            if (!socket.data.wantsMatch) return;
             if (matchmakingQueue.some((p) => p.id === socket.id)) return;
 
             name = profile.username;
@@ -1507,8 +1712,12 @@ io.on("connection", (socket) => {
             name,
             avatar,
             rating,
-            timeControl: resolveTimeControl(data?.timeControl),
+            timeControl: resolveTimeControl(socket.data.matchRequest?.timeControl),
             joinedAt: Date.now(),
+            // After this long without a human in range, a computer opponent
+            // takes the seat.
+            houseAfterMs: houseWaitMs(),
+            houseStarting: false,
         };
 
         const opponent = findMatchForPlayer(player);
@@ -1521,6 +1730,7 @@ io.on("connection", (socket) => {
                 id: player.id,
                 name: player.name,
                 rating: player.rating,
+                timeControl: player.timeControl,
                 queueSize: matchmakingQueue.length,
             });
 
@@ -1531,6 +1741,7 @@ io.on("connection", (socket) => {
     });
 
     socket.on("cancel_matchmaking", () => {
+        socket.data.wantsMatch = false;
         removeFromQueue(socket.id);
         socket.emit("matchmaking_cancelled");
     });
@@ -1677,49 +1888,7 @@ io.on("connection", (socket) => {
             return;
         }
 
-        let result;
-        try {
-            result = g.game.move(move);
-        } catch (error) {
-            return;
-        }
-
-        if (!result) return;
-
-        const now = Date.now();
-        const diff = Math.max(0, now - g.lastTick);
-
-        if (g.activeColor === "w") {
-            g.whiteTime -= diff;
-            g.whiteTime += g.increment;
-        } else {
-            g.blackTime -= diff;
-            g.blackTime += g.increment;
-        }
-
-        g.lastTick = now;
-        g.activeColor = g.activeColor === "w" ? "b" : "w";
-
-        socket.to(roomId).emit("opponent_move", {
-            from: result.from,
-            to: result.to,
-            promotion: result.promotion,
-        });
-
-        io.to(roomId).emit("timer_update", {
-            whiteTime: g.whiteTime,
-            blackTime: g.blackTime,
-            activeColor: g.activeColor,
-        });
-
-        if (g.game.isGameOver()) {
-            if (g.game.isCheckmate()) {
-                // The side to move is the one that got mated.
-                finishPvPGame(roomId, "checkmate", g.game.turn() === "w" ? "b" : "w");
-            } else {
-                finishPvPGame(roomId, "draw", null);
-            }
-        }
+        applyPvPMove(roomId, g, move, socket.id);
     });
 
     socket.on("offer_draw", ({ roomId } = {}) => {
@@ -1733,6 +1902,11 @@ io.on("connection", (socket) => {
 
         // Remember who offered, so only the OTHER player can accept.
         g.drawOfferedBy = socket.id;
+
+        if (g.house && opponent === g.house.id) {
+            answerHouseDraw(roomId, g, socket.id);
+            return;
+        }
 
         io.to(opponent).emit("draw_offer");
     });
@@ -1793,6 +1967,17 @@ io.on("connection", (socket) => {
     socket.on("rematch_request", ({ roomId } = {}) => {
         if (!isNonEmptyString(roomId, 200)) return;
         if (!io.sockets.adapter.rooms.get(roomId)?.has(socket.id)) return;
+
+        const info = finishedGames.get(roomId);
+
+        if (info?.house) {
+            if (info.houseAsked) return;
+            info.houseAsked = true;
+
+            socket.emit("rematch_requested");
+            answerHouseRematch(roomId, info, socket);
+            return;
+        }
 
         socket.to(roomId).emit("rematch_offer");
         socket.emit("rematch_requested");
