@@ -342,7 +342,7 @@ function createBotGame(rawElo = 300) {
 // The pairing rules (rating range) live in matchmakingRules.js. A player who
 // finds no human in range gets a computer opponent (housePlayer.js).
 
-function findMatchForPlayer(player) {
+function findMatchForPlayer(player, options = {}) {
     // Drop players whose connection is gone.
     for (let i = matchmakingQueue.length - 1; i >= 0; i--) {
         if (!io.sockets.sockets.get(matchmakingQueue[i].id)) {
@@ -350,7 +350,7 @@ function findMatchForPlayer(player) {
         }
     }
 
-    const opponent = pickOpponent(player, matchmakingQueue);
+    const opponent = pickOpponent(player, matchmakingQueue, Date.now(), options);
 
     if (opponent) {
         removeFromQueue(opponent.id);
@@ -382,6 +382,16 @@ setInterval(() => {
         if (!HOUSE_ENABLED || player.houseStarting) continue;
         if (Date.now() - player.joinedAt < player.houseAfterMs) continue;
 
+        // Last look for a human: anyone in reach, without waiting for the
+        // range to widen.
+        const human = findMatchForPlayer(player, { widest: true });
+
+        if (human) {
+            removeFromQueue(player.id);
+            startPvPGame(player, human);
+            continue;
+        }
+
         player.houseStarting = true;
 
         launchHouseGame(player, newHouseOpponent(player), {
@@ -395,7 +405,7 @@ setInterval(() => {
             player.houseAfterMs += 15_000;
         });
     }
-}, 2000);
+}, 1000);
 
 // =============================
 // TIMER (PvP)
@@ -1714,8 +1724,8 @@ io.on("connection", (socket) => {
             rating,
             timeControl: resolveTimeControl(socket.data.matchRequest?.timeControl),
             joinedAt: Date.now(),
-            // After this long without a human in range, a computer opponent
-            // takes the seat.
+            // After this long without a human in reach, a computer opponent
+            // takes the seat (a few seconds).
             houseAfterMs: houseWaitMs(),
             houseStarting: false,
         };

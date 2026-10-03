@@ -12,11 +12,11 @@ function seeded(seed = 1) {
     };
 }
 
-test("a computer opponent steps in after 24 to 36 seconds", () => {
+test("a computer opponent steps in after 3 to 7 seconds", () => {
     const rng = seeded(7);
     for (let i = 0; i < 200; i++) {
         const wait = houseWaitMs(rng);
-        assert.ok(wait >= 24_000 && wait <= 36_000, String(wait));
+        assert.ok(wait >= 3000 && wait <= 7000, String(wait));
     }
 });
 

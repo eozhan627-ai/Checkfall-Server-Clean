@@ -38,6 +38,15 @@ test("players too far apart are never paired", () => {
     assert.equal(ratingsFit(player("a", 1000, 900), player("b", 1600, 900), NOW), true);
 });
 
+test("the last look before a computer opponent uses the full range", () => {
+    const me = player("me", 1000, 4);
+    const queue = [player("far", 1500, 1), player("tooFar", 1700, 1)];
+
+    assert.equal(pickOpponent(me, queue, NOW), null);
+    assert.equal(pickOpponent(me, queue, NOW, { widest: true }).id, "far");
+    assert.equal(pickOpponent(me, [queue[1]], NOW, { widest: true }), null);
+});
+
 test("the closest fitting opponent is chosen", () => {
     const me = player("me", 1000, 40);
     const queue = [player("far", 1600, 50), player("near", 1100, 1), player("mid", 1400, 10), me];

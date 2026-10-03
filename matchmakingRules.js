@@ -21,20 +21,26 @@ function waitedSeconds(player, now) {
 // Two players fit when the rating difference is inside the range of the one
 // who has waited longer. A real opponent now is worth more than a slightly
 // closer one later - the app is still small.
-export function ratingsFit(a, b, now = Date.now()) {
+// widest: use the full range at once (the last look for a human before a
+// computer opponent takes the seat).
+export function ratingsFit(a, b, now = Date.now(), { widest = false } = {}) {
+    const difference = Math.abs(a.rating - b.rating);
+
+    if (widest) return difference <= MAX_RATING_DIFFERENCE;
+
     const waited = Math.max(waitedSeconds(a, now), waitedSeconds(b, now));
-    return Math.abs(a.rating - b.rating) <= matchRange(waited);
+    return difference <= matchRange(waited);
 }
 
 // Of all fitting candidates, the one closest in rating; on a tie the one who
 // has waited longest. Returns null when nobody fits.
-export function pickOpponent(player, candidates, now = Date.now()) {
+export function pickOpponent(player, candidates, now = Date.now(), options = {}) {
     let best = null;
 
     for (const candidate of candidates) {
         if (candidate.id === player.id) continue;
         if (candidate.timeControl !== player.timeControl) continue;
-        if (!ratingsFit(player, candidate, now)) continue;
+        if (!ratingsFit(player, candidate, now, options)) continue;
 
         if (!best) {
             best = candidate;

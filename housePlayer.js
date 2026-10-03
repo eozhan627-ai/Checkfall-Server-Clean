@@ -10,10 +10,12 @@
 
 import crypto from "crypto";
 
-// How long a player searches before a computer opponent steps in. Not a
-// fixed number, so the start of such a game is not recognisable by its timing.
+// How long a player searches before a computer opponent steps in, when no
+// human in reach is searching. Only a few seconds - while the app is young
+// there is often nobody else - and not a fixed number, so the start of such
+// a game is not recognisable by its timing.
 export function houseWaitMs(rng = Math.random) {
-    return Math.round(24_000 + rng() * 12_000); // 24 - 36 s
+    return Math.round(3000 + rng() * 4000); // 3 - 7 s
 }
 
 // Same shape as a socket.io connection id.
