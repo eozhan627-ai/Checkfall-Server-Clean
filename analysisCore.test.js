@@ -2,13 +2,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Chess } from "chess.js";
 import {
+    botLevel,
     buildGame,
     buildReview,
     classifyMove,
+    combinedAccuracy,
     estimateRating,
+    knownRatings,
     moveAccuracy,
+    moveWeights,
+    performanceRating,
+    rescoreReview,
     sacrificedMaterial,
     scoreToCp,
+    summarizeGame,
     terminalEvaluation,
     winPct,
 } from "./analysisCore.js";
@@ -59,8 +66,111 @@ test("win chance and accuracy curves", () => {
     assert.ok(Math.abs(winPct(200) + winPct(-200) - 100) < 1e-9);
     assert.equal(Math.round(moveAccuracy(0)), 100);
     assert.ok(moveAccuracy(20) < 45);
-    assert.equal(estimateRating(null), null);
-    assert.ok(estimateRating(15) > estimateRating(80));
+});
+
+test("accuracy of a game: bad moves count, easy moves do not hide them", () => {
+    const same = (accuracy, count) => Array.from({ length: count }, () => ({ accuracy, weight: 1 }));
+
+    assert.equal(combinedAccuracy([]), null);
+    assert.equal(combinedAccuracy(same(80, 10)), 80);
+
+    // 29 perfect moves and one blunder: the plain average would say 97
+    const oneBlunder = combinedAccuracy([...same(100, 29), { accuracy: 5, weight: 1 }]);
+    assert.ok(oneBlunder > 60 && oneBlunder < 85, `one blunder gives ${oneBlunder}`);
+
+    // the same blunder weighs more when a lot was at stake around it
+    const atStake = combinedAccuracy([...same(100, 29).map((m) => ({ ...m, weight: 0.5 })), { accuracy: 5, weight: 12 }]);
+    assert.ok(atStake < oneBlunder);
+
+    // a move without any accuracy left does not break the harmonic mean
+    assert.ok(combinedAccuracy([...same(100, 5), { accuracy: 0, weight: 1 }]) > 0);
+});
+
+test("weights: quiet stretches count little, swings count a lot", () => {
+    assert.deepEqual(moveWeights([]), []);
+
+    const move = (color, winBefore, winAfter) => ({ color, winBefore, winAfter });
+
+    // nothing happens: every move has the smallest weight
+    const quiet = [move("w", 52, 52), move("b", 48, 48), move("w", 52, 52), move("b", 48, 48)];
+    assert.deepEqual(moveWeights(quiet), [0.5, 0.5, 0.5, 0.5]);
+
+    // Black throws the game away with the second move
+    const swing = [move("w", 52, 52), move("b", 48, 5), move("w", 95, 95), move("b", 5, 5)];
+    const weights = moveWeights(swing);
+    assert.equal(weights.length, 4);
+    assert.equal(weights[0], 0.5);
+    assert.equal(weights[1], 12);
+    assert.equal(weights[3], 0.5);
+});
+
+test("played like: follows the accuracy, but stays close to the known rating", () => {
+    // better play -> higher, and a long game needs more accuracy than a short one
+    assert.ok(performanceRating(90, 34) > performanceRating(75, 34));
+    assert.ok(performanceRating(75, 34) > performanceRating(55, 34));
+    assert.ok(performanceRating(85, 60) < performanceRating(85, 34));
+    assert.ok(performanceRating(85, 15) > performanceRating(85, 34));
+    assert.equal(performanceRating(100, 34), 3000);
+    assert.equal(performanceRating(10, 34), 100);
+
+    assert.equal(estimateRating({ accuracy: null, moves: 30, rating: 1200 }), null);
+    assert.equal(estimateRating({ accuracy: 80, moves: 0, rating: 1200 }), null);
+
+    // a club player does not turn into a master because of one clean game ...
+    const clean = estimateRating({ accuracy: 96, moves: 34, rating: 1000 });
+    assert.ok(clean > 1300 && clean < 2000, `clean game: ${clean}`);
+    // ... nor into a beginner because of one bad one
+    const bad = estimateRating({ accuracy: 50, moves: 34, rating: 1500 });
+    assert.ok(bad > 700 && bad < 1500, `bad game: ${bad}`);
+
+    // an ordinary game for the rating leaves the estimate near the rating
+    const usual = estimateRating({ accuracy: 77, moves: 34, rating: 1200 });
+    assert.ok(Math.abs(usual - 1200) <= 100, `usual game: ${usual}`);
+
+    // a short game moves the estimate less than a long one
+    const short = estimateRating({ accuracy: 97, moves: 8, rating: 1000 });
+    const long = estimateRating({ accuracy: 97, moves: 60, rating: 1000 });
+    assert.ok(short < long);
+
+    // unknown rating: the start rating of a new player is assumed
+    assert.equal(
+        estimateRating({ accuracy: 77, moves: 34 }),
+        estimateRating({ accuracy: 77, moves: 34, rating: 1000 })
+    );
+
+    // always a round number inside the rating range
+    for (const accuracy of [0, 35, 62.5, 88.8, 100]) {
+        for (const rating of [100, 1000, 3200]) {
+            const value = estimateRating({ accuracy, moves: 40, rating });
+            assert.ok(value >= 100 && value <= 3200 && value % 50 === 0, `${accuracy}/${rating} -> ${value}`);
+        }
+    }
+});
+
+test("known ratings of the two players", () => {
+    assert.equal(botLevel("Stockfish (1200)"), 1200);
+    assert.equal(botLevel("Stockfish (full strength)"), 3200);
+    assert.equal(botLevel("Stockfish (volle Stärke)"), 3200);
+    assert.equal(botLevel(null), null);
+
+    // an opponent with an account
+    assert.deepEqual(
+        knownRatings({ playerColor: "w", userRating: 900, opponentRating: 1150, mode: "online" }),
+        { w: 900, b: 1150 }
+    );
+    // a practice bot: its level
+    assert.deepEqual(
+        knownRatings({ playerColor: "b", userRating: 900, mode: "bot", opponentName: "Stockfish (1500)" }),
+        { w: 1500, b: 900 }
+    );
+    // matchmaking opponent without an account: about as strong as the user
+    assert.deepEqual(
+        knownRatings({ playerColor: "w", userRating: 900, mode: "online", opponentName: "milo42" }),
+        { w: 900, b: 900 }
+    );
+    // side of the user unknown (old games)
+    assert.deepEqual(knownRatings({ playerColor: null, userRating: 900 }), { w: 900, b: 900 });
+    assert.deepEqual(knownRatings({ playerColor: "w", userRating: null }), { w: null, b: null });
 });
 
 test("mate scores sort correctly", () => {
@@ -134,6 +244,7 @@ test("full review of a short game with hand-made evaluations", () => {
     const review = buildReview(game, evaluations, { depth: 12, tier: "diamond" });
 
     assert.equal(review.version, 2);
+    assert.equal(review.scoring, 2);
     assert.deepEqual(review.moves.map((m) => m.classification), ["inaccuracy", "best", "blunder", "best"]);
 
     const mate = review.moves[3];
@@ -150,6 +261,38 @@ test("full review of a short game with hand-made evaluations", () => {
     assert.ok(review.accuracy.b > review.accuracy.w);
     assert.equal(review.counts.w.blunder, 1);
     assert.deepEqual(review.keyMoments, [2]);
+
+    // two moves each: the estimate stays near the start rating of a new player
+    assert.ok(review.estimatedRating.w < review.estimatedRating.b);
+    assert.ok(review.estimatedRating.b <= 1200);
+});
+
+test("the summary of a stored review can be recalculated from its moves", () => {
+    const game = buildGame("1. f3 e5 2. g4 Qh4#");
+    const E = (cp, bestMove) => ({ cp, mate: null, second: null, bestMove, pv: [bestMove], depth: 12 });
+
+    const evaluations = [
+        E(30, "e2e4"),
+        E(60, "e7e5"),
+        E(-60, "d2d4"),
+        { cp: null, mate: 1, second: null, bestMove: "d8h4", pv: ["d8h4"], depth: 12 },
+        terminalEvaluation("checkmate"),
+    ];
+
+    const ratings = { w: 800, b: 1600 };
+    const review = buildReview(game, evaluations, { depth: 12, tier: "gold", ratings });
+
+    // a review saved before the numbers changed: only the moves are trusted
+    const stored = { ...review, accuracy: { w: 99, b: 99 }, estimatedRating: { w: 3000, b: 3000 }, phases: null };
+    delete stored.scoring;
+
+    assert.deepEqual(rescoreReview(stored, ratings), review);
+
+    // the known ratings only change "played like"
+    const other = summarizeGame(review.moves, { w: 2000, b: 2000 });
+    assert.deepEqual(other.accuracy, review.accuracy);
+    assert.deepEqual(other.phases, review.phases);
+    assert.ok(other.estimatedRating.w > review.estimatedRating.w);
 });
 
 test("a played move that beats the engine's choice counts as best", () => {

@@ -26,6 +26,7 @@ import {
     thinkTimeMs,
 } from "./housePlayer.js";
 import { setupVipRoutes } from "./vipSubscriptions.js";
+import { setupPromoRoutes, startGrantChecks } from "./vipGrants.js";
 import { saveReport, setupFeedbackRoutes } from "./feedback.js";
 import { calculateGameRatings } from "./elo.js";
 
@@ -1226,6 +1227,11 @@ app.post("/upload-avatar", upload.single("avatar"), async (req, res) => {
 
 // VIP subscriptions: /vip/sync and /revenuecat/webhook
 setupVipRoutes(app, { getAuthIdFromRequest });
+
+// Promo codes for free VIP (e.g. the TikTok launch promo): /promo/redeem.
+// Codes whose time is up are ended once an hour.
+setupPromoRoutes(app, { getAuthIdFromRequest });
+startGrantChecks();
 
 // Support form and error reports of the app: /support and /client-error
 setupFeedbackRoutes(app, { getAuthIdFromRequest });

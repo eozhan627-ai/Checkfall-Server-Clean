@@ -10,6 +10,8 @@ import {
     ANALYSIS_VERSION,
     buildGame,
     buildReview,
+    knownRatings,
+    rescoreReview,
     scoreToCp,
     terminalEvaluation,
 } from "./analysisCore.js";
@@ -101,6 +103,8 @@ function emitToGame(gameId, event, payload) {
 // =============================
 
 export function setupAnalysisHandlers(io) {
+    rescoreStoredReviews().catch((error) => console.log("RESCORE REVIEWS ERROR:", error?.message));
+
     io.on("connection", (socket) => {
         socket.on("analyze_game", async (payload, ack) => {
             const gameId = payload?.gameId;
@@ -433,10 +437,24 @@ async function runAnalysis({ gameId, game, authId, profile, settings, tier, play
         releaseSlot();
     }
 
-    const analysis = buildReview(parsed, evaluations, { depth: reachedDepth, tier });
+    const players = await loadPlayers({ game, profile, playerColor }).catch(() => null);
+    const opponent = playerColor === "w" ? players?.black : players?.white;
+
+    const analysis = buildReview(parsed, evaluations, {
+        depth: reachedDepth,
+        tier,
+        // "Played like" starts from what the players are rated.
+        ratings: knownRatings({
+            playerColor,
+            userRating: profile?.rating ?? null,
+            opponentRating: opponent?.rating ?? null,
+            mode: game.mode,
+            opponentName: game.opponent_name,
+        }),
+    });
 
     analysis.playerColor = playerColor;
-    analysis.players = await loadPlayers({ game, profile, playerColor }).catch(() => null);
+    analysis.players = players;
     analysis.result = game.result ?? null;
     analysis.mode = game.mode ?? null;
 
@@ -465,6 +483,79 @@ async function runAnalysis({ gameId, game, authId, profile, settings, tier, play
 
     await finish();
     closeAdGate(gameId);
+}
+
+// =============================
+// STORED REVIEWS: NEW NUMBERS WITHOUT A NEW ANALYSIS
+// =============================
+// Accuracy and "played like" are computed from the stored moves. When the way
+// they are computed changes (SCORING_VERSION in analysisCore.js), the reviews
+// that are already saved are recalculated once when the server starts - the
+// app reads them straight from the database. No engine is needed for this.
+
+const RESCORE_PAGE = 50;
+
+export async function rescoreStoredReviews() {
+    if (!supabaseAdmin) return;
+
+    let updated = 0;
+
+    for (;;) {
+        // Reviews in the current format that do not have the new numbers yet.
+        const { data: games, error } = await supabaseAdmin
+            .from("games")
+            .select("id, user_id, mode, opponent_name, analysis")
+            .eq("analyzed", true)
+            .eq("analysis->>version", String(ANALYSIS_VERSION))
+            .is("analysis->>scoring", null)
+            .limit(RESCORE_PAGE);
+
+        if (error) throw new Error(error.message);
+        if (!games || games.length === 0) break;
+
+        // Only needed for games that do not say which side the user played.
+        const { data: profiles } = await supabaseAdmin
+            .from("profiles")
+            .select("id, rating")
+            .in("id", [...new Set(games.map((game) => game.user_id))]);
+
+        const ratingOf = new Map((profiles ?? []).map((profile) => [profile.id, profile.rating]));
+
+        let saved = 0;
+
+        for (const game of games) {
+            const review = game.analysis;
+            if (!Array.isArray(review?.moves)) continue;
+
+            const color = review.playerColor;
+            const user = color === "w" ? review.players?.white : color === "b" ? review.players?.black : null;
+            const opponent = color === "w" ? review.players?.black : color === "b" ? review.players?.white : null;
+
+            const analysis = rescoreReview(
+                review,
+                knownRatings({
+                    playerColor: color ?? null,
+                    // the rating at the time of the analysis, if it was stored
+                    userRating: user?.rating ?? ratingOf.get(game.user_id) ?? null,
+                    opponentRating: opponent?.rating ?? null,
+                    mode: game.mode,
+                    opponentName: game.opponent_name,
+                })
+            );
+
+            const { error: saveError } = await supabaseAdmin.from("games").update({ analysis }).eq("id", game.id);
+
+            if (saveError) console.log("RESCORE REVIEW ERROR:", game.id, saveError.message);
+            else saved += 1;
+        }
+
+        updated += saved;
+
+        // Nothing could be saved: stop instead of fetching the same games again.
+        if (saved === 0) break;
+    }
+
+    if (updated > 0) console.log(`RESCORE REVIEWS: ${updated} stored review(s) updated`);
 }
 
 // =============================

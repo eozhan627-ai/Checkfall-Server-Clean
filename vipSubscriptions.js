@@ -3,7 +3,9 @@
 // The app buys the subscription in the store. RevenueCat keeps track of it
 // (free trial, monthly renewal, cancellation, expiry) and is the source of
 // truth. This file asks RevenueCat which plan a player currently has and
-// writes it to profiles.vip_tier - the app itself can never set that column.
+// stores it as the plan without promo codes (profiles.vip_base_tier).
+// profiles.vip_tier then becomes the better of that plan and a running
+// promo code (vipGrants.js) - the app itself can never set either column.
 //
 // Needed on the server (Render -> Environment):
 //   REVENUECAT_SECRET_KEY     secret API key of the RevenueCat project (sk_...)
@@ -12,6 +14,7 @@
 //                             header value"
 
 import { supabaseAdmin } from "./supabaseAdmin.js";
+import { recomputeVip } from "./vipGrants.js";
 
 const SECRET_KEY = process.env.REVENUECAT_SECRET_KEY || "";
 const WEBHOOK_AUTH = process.env.REVENUECAT_WEBHOOK_AUTH || "";
@@ -86,6 +89,23 @@ export async function syncVip(authId) {
     // Never bought anything: a plan that was set by hand (testers, gifts)
     // stays as it is.
     if (!state.known) return { tier: current, expiresAt: null, changed: false };
+
+    // The store decides the plan without codes; a running promo code can lift
+    // it (a Gold code beats an expired trial, a Diamond subscription beats a
+    // Gold code).
+    const { error: baseError } = await supabaseAdmin
+        .from("profiles")
+        .update({ vip_base_tier: state.tier, vip_expires_at: state.expiresAt })
+        .eq("id", authId);
+
+    if (!baseError) {
+        const result = await recomputeVip(authId);
+        return { tier: result.tier, expiresAt: state.expiresAt, changed: result.tier !== current };
+    }
+
+    // Database without promo codes (supabase/006 not run): the store's plan
+    // is the plan, as before.
+    if (!["42703", "PGRST204"].includes(baseError.code)) throw new Error(baseError.message);
 
     let { error } = await supabaseAdmin
         .from("profiles")

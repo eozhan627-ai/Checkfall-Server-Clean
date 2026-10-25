@@ -11,6 +11,12 @@ import { detectTacticalMotif } from "./tacticsDetector.js";
 
 export const ANALYSIS_VERSION = 2;
 
+// Version of the numbers that sum a game up (accuracy, "played like").
+// They are computed from the stored moves, so a review saved with an older
+// version is brought up to date without asking the engine again
+// (see rescoreReview).
+export const SCORING_VERSION = 2;
+
 export const CLASSIFICATIONS = [
     "brilliant",
     "great",
@@ -47,14 +53,6 @@ export function winPct(cp) {
 export function moveAccuracy(winLoss) {
     const raw = 103.1668 * Math.exp(-0.04354 * Math.max(0, winLoss)) - 3.1669;
     return Math.max(0, Math.min(100, raw));
-}
-
-// Rough playing strength for one game from the average centipawn loss.
-// Only an estimate - shown as such in the app.
-export function estimateRating(acpl) {
-    if (acpl === null || !Number.isFinite(acpl)) return null;
-    const rating = 3100 * Math.exp(-0.01 * acpl);
-    return Math.max(100, Math.min(3200, Math.round(rating / 50) * 50));
 }
 
 // { cp, mate } from the engine (side-to-move view) -> one comparable number.
@@ -316,6 +314,236 @@ export function classifyMove(c) {
 }
 
 // =============================
+// THE WHOLE GAME: ACCURACY AND "PLAYED LIKE"
+// =============================
+
+// Accuracy of a set of moves: [{ accuracy, weight }] -> 0-100.
+//
+// A plain average is far too friendly. Most moves of a game are easy (theory,
+// recaptures, a position that is already won or lost), so even a game with
+// several blunders ends up near 90 and every player looks alike. Lichess
+// solves it like this, and so do we:
+//   - an average in which a move counts more the more was at stake around it
+//   - the harmonic mean, which bad moves pull down hard
+// and the result is the middle of the two.
+export function combinedAccuracy(items) {
+    if (items.length === 0) return null;
+
+    let weightSum = 0;
+    let weighted = 0;
+    let inverse = 0;
+
+    for (const { accuracy, weight } of items) {
+        weightSum += weight;
+        weighted += weight * accuracy;
+        inverse += 1 / Math.max(1, accuracy);
+    }
+
+    return (weighted / weightSum + items.length / inverse) / 2;
+}
+
+// How much was at stake around every move: the spread of the win chances
+// over the last few positions, 0.5 (nothing going on) to 12 (wild).
+//
+// @param {Array<{color:string, winBefore:number, winAfter:number}>} moves
+//        win chances of the mover (0-100) before and after the move
+export function moveWeights(moves) {
+    if (moves.length === 0) return [];
+
+    // Win chance from White's point of view: start, then after every move.
+    const white = [moves[0].color === "w" ? moves[0].winBefore : 100 - moves[0].winBefore];
+    for (const move of moves) {
+        white.push(move.color === "w" ? move.winAfter : 100 - move.winAfter);
+    }
+
+    // Longer games look at more positions at once.
+    const size = Math.max(2, Math.min(8, Math.floor(moves.length / 10)));
+
+    return moves.map((_, index) => {
+        // The window ends with the position after the move.
+        const start = Math.max(0, index + 2 - size);
+        const window = white.slice(start, start + size);
+
+        const mean = window.reduce((sum, value) => sum + value, 0) / window.length;
+        const variance = window.reduce((sum, value) => sum + (value - mean) ** 2, 0) / window.length;
+
+        return Math.max(0.5, Math.min(12, Math.sqrt(variance)));
+    });
+}
+
+// ---- "played like" ----
+// The numbers below were measured on games of players whose rating is known
+// (online games of club players rated about 1100 to 1950 on Lichess, and
+// well-known master games), analysed the way the server does it.
+
+// Long games look more accurate than short ones: whoever is still playing
+// after 60 moves has made many easy moves in a decided position, while a game
+// that is over after 15 moves consists of little but its mistakes. The gap to
+// 100 shrinks with the length of the game; this puts every game on the
+// footing of a typical one.
+const TYPICAL_MOVES = 34;
+const LENGTH_EXPONENT = 0.4;
+
+function accuracyAtTypicalLength(accuracy, moves) {
+    const length = Math.max(10, Math.min(60, moves));
+    return 100 - (100 - accuracy) * Math.pow(length / TYPICAL_MOVES, LENGTH_EXPONENT);
+}
+
+// Accuracy (of a game of typical length) -> the rating at which players
+// reach it on average, on the scale the app uses for its ratings
+// (beginner 400 ... expert 2000).
+const RATING_BY_ACCURACY = [
+    [40, 100],
+    [50, 220],
+    [60, 400],
+    [70, 730],
+    [75, 970],
+    [80, 1250],
+    [85, 1560],
+    [90, 1920],
+    [93, 2250],
+    [95, 2500],
+    [97, 2750],
+    [100, 3000],
+];
+
+/**
+ * What one game on its own looked like, as a rating.
+ *
+ * @param {number} accuracy accuracy of the player in the game
+ * @param {number} moves    number of moves the player made
+ */
+export function performanceRating(accuracy, moves) {
+    const table = RATING_BY_ACCURACY;
+    const value = accuracyAtTypicalLength(accuracy, moves);
+
+    if (value <= table[0][0]) return table[0][1];
+
+    for (let i = 1; i < table.length; i++) {
+        const [a0, r0] = table[i - 1];
+        const [a1, r1] = table[i];
+        if (value <= a1) return r0 + ((value - a0) / (a1 - a0)) * (r1 - r0);
+    }
+
+    return table[table.length - 1][1];
+}
+
+// A single game says little about a player: the same person is easily 10 to
+// 15 points of accuracy better or worse from one game to the next. So the
+// estimate starts at the rating the player is known to have and only moves
+// part of the way towards what this game looked like - further the more
+// moves there were.
+const TRUST_HALF_MOVES = 30; // own moves after which the game counts half
+const TRUST_MAX = 0.65;
+const UNKNOWN_RATING = 1000; // start rating of a new player
+
+/**
+ * "Played like": rough playing strength shown for one game.
+ * Only an estimate - shown as such in the app.
+ *
+ * @param {object} p
+ * @param {number|null} p.accuracy  accuracy of the player in this game
+ * @param {number} p.moves          number of moves the player made
+ * @param {number|null} [p.rating]  rating the player is known to have
+ */
+export function estimateRating({ accuracy, moves, rating = null }) {
+    if (accuracy === null || !Number.isFinite(accuracy) || !moves) return null;
+
+    const known = Number.isFinite(rating) ? rating : UNKNOWN_RATING;
+    const trust = Math.min(TRUST_MAX, moves / (moves + TRUST_HALF_MOVES));
+    const estimate = known + trust * (performanceRating(accuracy, moves) - known);
+
+    return Math.max(100, Math.min(3200, Math.round(estimate / 50) * 50));
+}
+
+// The level of a practice bot is only stored in its name: "Stockfish (1200)".
+// A name without a number is the engine at full strength.
+export function botLevel(name) {
+    if (typeof name !== "string" || !name) return null;
+
+    const level = /\((\d{2,4})\)/.exec(name);
+    return level ? Number(level[1]) : 3200;
+}
+
+/**
+ * The ratings the two players are known to have, for estimateRating().
+ *
+ * @param {object} p
+ * @param {"w"|"b"|null} p.playerColor colour the user played, if known
+ * @param {number|null} p.userRating       rating of the user
+ * @param {number|null} [p.opponentRating] rating of an opponent with an account
+ * @param {string|null} [p.mode]           "bot" | "online" | ...
+ * @param {string|null} [p.opponentName]
+ */
+export function knownRatings({ playerColor, userRating, opponentRating = null, mode = null, opponentName = null }) {
+    const user = Number.isFinite(userRating) ? userRating : null;
+
+    // Old games do not say which side the user had.
+    if (playerColor !== "w" && playerColor !== "b") return { w: user, b: user };
+
+    // No account on the other side: a bot has its level, and an opponent from
+    // matchmaking was picked because they are about as strong as the user.
+    const opponent =
+        (Number.isFinite(opponentRating) ? opponentRating : null) ??
+        (mode === "bot" ? botLevel(opponentName) : null) ??
+        user;
+
+    return playerColor === "w" ? { w: user, b: opponent } : { w: opponent, b: user };
+}
+
+/**
+ * Everything the review says about the game as a whole, from its moves.
+ *
+ * @param {Array<{color:string, winBefore:number, winAfter:number, accuracy:number, phase?:string}>} moves
+ * @param {{ w?: number|null, b?: number|null }} [ratings] ratings the two
+ *        players are known to have (see estimateRating)
+ */
+export function summarizeGame(moves, ratings = {}) {
+    const weights = moveWeights(moves);
+    const perSide = (fn) => ({ w: fn("w"), b: fn("b") });
+
+    const items = (side, phase = null) =>
+        moves
+            .map((move, index) => ({ move, weight: weights[index] }))
+            .filter(({ move }) => move.color === side && (phase === null || move.phase === phase))
+            .map(({ move, weight }) => ({ accuracy: move.accuracy, weight }));
+
+    const rounded = (value) => (value === null ? null : round1(value));
+
+    const accuracy = perSide((side) => rounded(combinedAccuracy(items(side))));
+
+    const phases = perSide((side) => {
+        const out = {};
+        for (const phase of ["opening", "middlegame", "endgame"]) {
+            out[phase] = rounded(combinedAccuracy(items(side, phase)));
+        }
+        return out;
+    });
+
+    const estimatedRating = perSide((side) =>
+        estimateRating({
+            accuracy: accuracy[side],
+            moves: moves.filter((move) => move.color === side).length,
+            rating: ratings?.[side] ?? null,
+        })
+    );
+
+    return { accuracy, phases, estimatedRating };
+}
+
+/**
+ * Brings the summary numbers of a stored review up to date. The moves are
+ * left alone, so no engine is needed.
+ */
+export function rescoreReview(review, ratings = {}) {
+    return {
+        ...review,
+        ...summarizeGame(review.moves, ratings),
+        scoring: SCORING_VERSION,
+    };
+}
+
+// =============================
 // FULL REVIEW
 // =============================
 
@@ -323,18 +551,16 @@ export function classifyMove(c) {
  * @param {ReturnType<typeof buildGame>} game
  * @param {Array<{cp:number|null, mate:number|null, second:{cp:number|null,mate:number|null}|null, bestMove:string|null, pv:string[], depth:number}>} evaluations
  *        one per position, from the side to move's point of view
- * @param {{ depth: number, tier: string }} meta
+ * @param {{ depth: number, tier: string, ratings?: { w?: number|null, b?: number|null } }} meta
+ *        ratings: what the two players are rated (for "played like")
  */
 export function buildReview(game, evaluations, meta) {
     const { moves, opening } = game;
 
     const reviewed = [];
     const counts = { w: {}, b: {} };
-    const accuracySum = { w: 0, b: 0 };
     const cpLossSum = { w: 0, b: 0 };
     const moveCount = { w: 0, b: 0 };
-    const phaseSum = { w: {}, b: {} };
-    const phaseCount = { w: {}, b: {} };
 
     // ---- make the engine's numbers consistent along the game ----
     // The position after a move was searched one move deeper than the
@@ -415,11 +641,8 @@ export function buildReview(game, evaluations, meta) {
 
         const side = move.color;
         counts[side][classification] = (counts[side][classification] || 0) + 1;
-        accuracySum[side] += accuracy;
         cpLossSum[side] += cpLoss;
         moveCount[side] += 1;
-        phaseSum[side][move.phase] = (phaseSum[side][move.phase] || 0) + accuracy;
-        phaseCount[side][move.phase] = (phaseCount[side][move.phase] || 0) + 1;
 
         // White's point of view for everything the app draws.
         const whiteCp = side === "w" ? cpAfter : -cpAfter;
@@ -471,18 +694,11 @@ export function buildReview(game, evaluations, meta) {
 
     const perSide = (fn) => ({ w: fn("w"), b: fn("b") });
 
-    const accuracy = perSide((s) => (moveCount[s] ? round1(accuracySum[s] / moveCount[s]) : null));
     const acpl = perSide((s) => (moveCount[s] ? Math.round(cpLossSum[s] / moveCount[s]) : null));
 
-    const phases = perSide((s) => {
-        const out = {};
-        for (const phase of ["opening", "middlegame", "endgame"]) {
-            out[phase] = phaseCount[s][phase]
-                ? round1(phaseSum[s][phase] / phaseCount[s][phase])
-                : null;
-        }
-        return out;
-    });
+    // From the moves exactly as they are stored, so that rescoreReview()
+    // gets the same numbers later.
+    const { accuracy, phases, estimatedRating } = summarizeGame(reviewed, meta.ratings);
 
     const keyMoments = reviewed
         .filter((m) => ["brilliant", "great", "miss", "mistake", "blunder"].includes(m.classification))
@@ -490,13 +706,14 @@ export function buildReview(game, evaluations, meta) {
 
     return {
         version: ANALYSIS_VERSION,
+        scoring: SCORING_VERSION,
         depth: meta.depth,
         tier: meta.tier,
         opening: { name: opening.name, plies: opening.plies },
         moves: reviewed,
         accuracy,
         acpl,
-        estimatedRating: perSide((s) => estimateRating(acpl[s])),
+        estimatedRating,
         counts,
         phases,
         keyMoments,

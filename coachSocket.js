@@ -1,9 +1,8 @@
 import { Chess } from "chess.js";
+import { coachConfigured, requestCoachAnswer } from "./coachApi.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
 
 const DAILY_LIMIT = { silver: 5, gold: 20, diamond: 200 };
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = "claude-haiku-4-5-20251001";
 
 const COACH_NAME = "Uhu"; // NEU: hier den Namen des Maskottchens aendern, falls gewuenscht
 
@@ -61,9 +60,15 @@ function describeMoveForCoach({ move, game, index }) {
 }
 
 export function setupCoachHandlers(io) {
+    if (!coachConfigured()) {
+        console.log("COACH: ANTHROPIC_API_KEY is not set - the coach cannot answer questions.");
+    }
+
     io.on("connection", (socket) => {
-        socket.on("coach_message", async ({ gameId, moveIndex, question }, ack) => {
+        socket.on("coach_message", async (payload, ack) => {
             try {
+                const { gameId, moveIndex, question, language } = payload ?? {};
+
                 const authId = socket.data.authId;
                 if (!authId) throw new Error("NOT_AUTHENTICATED");
 
@@ -108,29 +113,22 @@ export function setupCoachHandlers(io) {
                     ? describeMoveForCoach({ move, game, index: moveIndex - 1 })
                     : `General question about the game. PGN: ${game.pgn}`;
 
+                // The app sends the language the player has chosen.
+                const answerLanguage = language === "de" ? "German" : "English";
+
                 const systemPrompt =
                     `You are ${COACH_NAME}, a friendly, encouraging chess coach in the app POVCheck. ` +
                     "Explain chess moves clearly for hobby players, concretely and briefly (max. 4 sentences), " +
-                    "without too much jargon. Be encouraging, even about mistakes. Always answer in English. " +
+                    `without too much jargon. Be encouraging, even about mistakes. Always answer in ${answerLanguage}, ` +
+                    "but write the moves exactly in the notation you are given (e.g. Nf3). " +
                     "Rely on the engine information you are given and do not invent moves or evaluations.";
 
-                const response = await fetch("https://api.anthropic.com/v1/messages", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "x-api-key": ANTHROPIC_API_KEY,
-                        "anthropic-version": "2023-06-01",
-                    },
-                    body: JSON.stringify({
-                        model: MODEL,
-                        max_tokens: 400,
-                        system: systemPrompt,
-                        messages: [{ role: "user", content: `${contextText}\n\nQuestion: ${question.trim()}` }],
-                    }),
+                // Throws when there is no real answer (see coachApi.js) - then
+                // the question is not counted either.
+                const answer = await requestCoachAnswer({
+                    system: systemPrompt,
+                    question: `${contextText}\n\nQuestion: ${question.trim()}`,
                 });
-
-                const data = await response.json();
-                const answer = data?.content?.[0]?.text || "Sorry, something went wrong.";
 
                 await supabaseAdmin
                     .from("coach_usage")
@@ -143,7 +141,8 @@ export function setupCoachHandlers(io) {
                     ack({ ok: true, answer, remaining: limit - (currentCount + 1) });
                 }
             } catch (error) {
-                console.log("COACH ERROR:", error.message);
+                // `detail` is the real reason (e.g. what the API answered).
+                console.log("COACH ERROR:", error.message, error.detail ? `- ${error.detail}` : "");
                 if (typeof ack === "function") ack({ ok: false, error: error.message });
             }
         });
