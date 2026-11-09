@@ -15,9 +15,11 @@ export const ENGINE_ELO_MIN = 1320;
 export const ENGINE_ELO_MAX = 3190;
 
 // Wie viele Kandidatenzüge wir uns von der Engine geben lassen, um daraus
-// im "weak mode" (Ziel-Elo unter ENGINE_ELO_MIN) gewichtet einen auszuwählen
-// statt immer stur den Top-Zug zu spielen.
-export const WEAK_MODE_MULTIPV = 8;
+// im "weak mode" (Ziel-Elo unter ENGINE_ELO_MIN) einen auszuwählen. Hoch
+// genug, dass auch richtig schlechte Züge dabei sind (eine Figur einstellen,
+// ein Schlagen übersehen) - mit nur 8 Kandidaten waren alle noch ordentlich
+// und der Bot hat selbst bei 350 Elo kaum gepatzt.
+export const WEAK_MODE_MULTIPV = 30;
 
 export function computeEloProfile(rawElo) {
     const n = Number(rawElo);
@@ -46,30 +48,43 @@ export function computeEloProfile(rawElo) {
     };
 }
 
+// Wie viel ein Zug mindestens kostet (in Centipawn), damit er als echter
+// Patzer zählt - z.B. eine Figur hängen lassen.
+const BLUNDER_LOSS = 150;
+
+/** Chance pro Zug auf einen gezielten Patzer: ~18% bei 350, ~11% bei 800, ~5% bei 1200. */
+export function blunderChance(belowFloorRatio) {
+    if (belowFloorRatio <= 0) return 0;
+    return 0.03 + belowFloorRatio * 0.2;
+}
+
 // Wählt aus den (bereits nach cp absteigend sortierten) Kandidatenzügen
-// gewichtet einen aus. Je höher belowFloorRatio, desto "flacher" die
-// Gewichtung (mehr Ungenauigkeiten) und desto größer die Chance auf einen
-// echten Patzer (schwächster der Kandidaten wird gespielt - z.B. eine
-// Figur, die dabei hängen bleibt).
-export function chooseWeightedMove(candidates, belowFloorRatio) {
+// einen aus - so, wie ein Mensch dieser Stärke spielt:
+// - mit blunderChance() ein echter Patzer: ein Zug, der mindestens
+//   BLUNDER_LOSS kostet (zufällig unter diesen, nicht immer der schlimmste);
+// - sonst gewichtet nach Bewertung, mit einer "Temperatur", die nach unten
+//   stark wächst: bei 350 Elo werden auch Züge, die 2-3 Bauern kosten,
+//   regelmäßig gespielt, bei 1200 fast nur noch gute.
+export function chooseWeightedMove(candidates, belowFloorRatio, random = Math.random) {
     if (candidates.length === 0) return null;
     if (candidates.length === 1) return candidates[0].uci;
 
     const best = candidates[0].cp;
 
-    // Temperatur in "Centipawn": klein = fast immer bester Zug,
-    // groß = auch deutlich schwächere Kandidaten werden regelmäßig gespielt.
-    const temperature = 35 + belowFloorRatio * 220;
-
-    const blunderChance = belowFloorRatio * 0.16; // bis zu ~16% bei Elo 0
-    if (Math.random() < blunderChance) {
-        return candidates[candidates.length - 1].uci;
+    if (random() < blunderChance(belowFloorRatio)) {
+        const blunders = candidates.filter((c) => best - c.cp >= BLUNDER_LOSS);
+        const pool = blunders.length > 0 ? blunders : candidates.slice(Math.ceil(candidates.length / 2));
+        return pool[Math.floor(random() * pool.length)].uci;
     }
 
-    const weights = candidates.map((c) => Math.exp(-(best - c.cp) / temperature));
+    // Temperatur in "Centipawn": klein = fast immer bester Zug,
+    // groß = auch deutlich schwächere Kandidaten werden regelmäßig gespielt.
+    const temperature = 40 + belowFloorRatio * 360;
+
+    const weights = candidates.map((c) => Math.exp(-Math.min(5000, best - c.cp) / temperature));
     const total = weights.reduce((a, b) => a + b, 0);
 
-    let r = Math.random() * total;
+    let r = random() * total;
     for (let i = 0; i < candidates.length; i++) {
         r -= weights[i];
         if (r <= 0) return candidates[i].uci;

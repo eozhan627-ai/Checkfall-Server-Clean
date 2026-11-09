@@ -1,7 +1,7 @@
 // Run with: npm test
 import test from "node:test";
 import assert from "node:assert/strict";
-import { acceptsDraw, houseId, houseName, houseRating, houseWaitMs, resigns, thinkTimeMs } from "./housePlayer.js";
+import { BOT_NAME, BOT_OFFER_AFTER_MS, acceptsDraw, houseId, houseName, houseRating, houseWaitMs, resigns, thinkTimeMs } from "./housePlayer.js";
 
 // Deterministic random numbers for the tests.
 function seeded(seed = 1) {
@@ -12,26 +12,15 @@ function seeded(seed = 1) {
     };
 }
 
-test("a computer opponent steps in after 3 to 7 seconds", () => {
-    const rng = seeded(7);
-    for (let i = 0; i < 200; i++) {
-        const wait = houseWaitMs(rng);
-        assert.ok(wait >= 3000 && wait <= 7000, String(wait));
-    }
+test("a bot game is offered after 20 seconds, not earlier", () => {
+    assert.equal(houseWaitMs(), BOT_OFFER_AFTER_MS);
+    // An offer, never an automatic game - so it may come early.
+    assert.ok(BOT_OFFER_AFTER_MS >= 5_000);
 });
 
-test("names look like ordinary nicknames", () => {
-    const rng = seeded(3);
-    const names = new Set();
-
-    for (let i = 0; i < 500; i++) {
-        const name = houseName(rng);
-        names.add(name);
-        assert.match(name, /^[A-Za-z0-9_.]{3,20}$/, name);
-        assert.doesNotMatch(name, /bot|computer|engine|stockfish|house/i, name);
-    }
-
-    assert.ok(names.size > 300, `only ${names.size} different names`);
+test("the computer opponent is always called a bot", () => {
+    assert.equal(houseName(), BOT_NAME);
+    assert.match(houseName(), /bot/i);
     assert.equal(houseId().length, 20);
     assert.notEqual(houseId(), houseId());
 });

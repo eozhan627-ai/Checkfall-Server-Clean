@@ -29,6 +29,10 @@ import { setupVipRoutes } from "./vipSubscriptions.js";
 import { setupPromoRoutes, startGrantChecks } from "./vipGrants.js";
 import { saveReport, setupFeedbackRoutes } from "./feedback.js";
 import { calculateGameRatings } from "./elo.js";
+import { currentOrNextRushHour, isRushHour } from "./rushHour.js";
+import { notifySearching, setupPushRoutes, startPushJobs } from "./push.js";
+import { setupDailyRoutes, startDailyJobs } from "./dailyChess.js";
+import { INVITE_TTL_MS, inviteCode, inviteExpired, invitePage, normalizeInviteCode } from "./invites.js";
 
 
 
@@ -56,6 +60,12 @@ const ALLOWED_INITIAL_RATINGS = [400, 700, 1000, 1500, 2000];
 
 const DEFAULT_RATING = 1000;
 const MAX_GUEST_RATING = 3200;
+
+// Public address of this server (invite links point here) and of the web
+// version of the app, once there is one (e.g. https://povcheck.com).
+const PUBLIC_URL = (process.env.PUBLIC_URL || "https://checkfall-server-clean-1.onrender.com").replace(/\/$/, "");
+const WEB_APP_URL = (process.env.WEB_APP_URL || "").replace(/\/$/, "");
+const DOWNLOAD_URL = process.env.DOWNLOAD_URL || "https://play.google.com/store/apps/details?id=com.povcheck.app";
 
 // Computer opponents in matchmaking (see housePlayer.js). Each one runs its
 // own engine process, so the number of such games at the same time is capped.
@@ -179,6 +189,10 @@ const authIdToRoom = new Map();
 const disconnectTimers = new Map();
 
 const matchmakingQueue = [];
+
+// Open invite links: code -> { code, host, timeControl, createdAt }
+// (host = the player object of the person who shared the link).
+const invites = new Map();
 
 const rateBuckets = new Map();
 
@@ -381,7 +395,7 @@ setInterval(() => {
             continue;
         }
 
-        if (!HOUSE_ENABLED || player.houseStarting) continue;
+        if (!HOUSE_ENABLED || player.botOffered) continue;
         if (Date.now() - player.joinedAt < player.houseAfterMs) continue;
 
         // Last look for a human: anyone in reach, without waiting for the
@@ -394,20 +408,40 @@ setInterval(() => {
             continue;
         }
 
-        player.houseStarting = true;
-
-        launchHouseGame(player, newHouseOpponent(player), {
-            houseColor: Math.random() < 0.5 ? "w" : "b",
-            mustBeQueued: true,
-        }).then((started) => {
-            if (started) return;
-
-            // No engine free right now: keep looking for a human, try again later.
-            player.houseStarting = false;
-            player.houseAfterMs += 15_000;
+        // Nobody there: OFFER a bot game. The player decides; the search for
+        // a human keeps running in the meantime.
+        player.botOffered = true;
+        io.to(player.id).emit("bot_offer", {
+            name: houseName(),
+            rating: houseRating(player.rating),
         });
     }
 }, 1000);
+
+// The player took the bot offer from the waiting screen.
+function acceptBotOffer(socket) {
+    const player = matchmakingQueue.find((p) => p.id === socket.id);
+
+    if (!player || !player.botOffered || player.houseStarting) {
+        socket.emit("bot_offer_failed", { reason: "NOT_WAITING" });
+        return;
+    }
+
+    player.houseStarting = true;
+
+    launchHouseGame(player, newHouseOpponent(player), {
+        houseColor: Math.random() < 0.5 ? "w" : "b",
+        mustBeQueued: true,
+    }).then((started) => {
+        player.houseStarting = false;
+        if (started) return;
+
+        // No engine free right now (or a human was found meanwhile).
+        if (matchmakingQueue.includes(player)) {
+            socket.emit("bot_offer_failed", { reason: "BUSY" });
+        }
+    });
+}
 
 // =============================
 // TIMER (PvP)
@@ -505,10 +539,9 @@ function finishPvPGame(roomId, type, winnerColor) {
     // A game only counts for the rating when both players are logged in.
     // Guests send their own rating, so it cannot be trusted.
     // Friendly games (challenges) are never rated either.
-    // Against a computer opponent the game counts for the signed-in player.
+    // Games against the bot never count for the rating.
     const bothSignedIn = Boolean(g.authIds.w && g.authIds.b);
-    const signedInVsHouse = Boolean(g.house && (g.authIds.w || g.authIds.b));
-    const rated = (bothSignedIn || signedInVsHouse) && !g.friendly;
+    const rated = bothSignedIn && !g.friendly && !g.house;
 
     const before = { w: g.ratings.w, b: g.ratings.b };
     const computed = calculateGameRatings(before, winnerColor);
@@ -851,6 +884,9 @@ function startPvPGame(playerA, playerB, options = {}) {
         // Set for games that started from a challenge: the app opens the
         // board from whatever screen the players are on.
         challenge: Boolean(options.challenge),
+        // The opponent is the POVCheck Bot: the app shows it as a bot.
+        bot: Boolean(game.house),
+        botColor: game.house ? game.house.color : null,
     });
 
     console.log("MATCH FOUND:", {
@@ -1235,6 +1271,98 @@ startGrantChecks();
 
 // Support form and error reports of the app: /support and /client-error
 setupFeedbackRoutes(app, { getAuthIdFromRequest });
+
+// Push notifications (push.js) and Daily Chess (dailyChess.js).
+setupPushRoutes(app, { getAuthIdFromRequest });
+startPushJobs();
+setupDailyRoutes(app, { getAuthIdFromRequest, areFriends, emitToUser });
+startDailyJobs({ emitToUser });
+
+// =============================
+// INVITE LINKS (see invites.js)
+// =============================
+
+function closeInvite(code) {
+    invites.delete(code);
+}
+
+function closeInvitesOfSocket(socketId) {
+    for (const [code, invite] of invites) {
+        if (invite.host.id === socketId) closeInvite(code);
+    }
+}
+
+function liveInvite(code) {
+    const invite = code ? invites.get(code) : null;
+    if (!invite) return null;
+
+    if (inviteExpired(invite) || !io.sockets.sockets.get(invite.host.id)) {
+        closeInvite(code);
+        return null;
+    }
+
+    return invite;
+}
+
+setInterval(() => {
+    for (const code of invites.keys()) liveInvite(code);
+}, 60_000);
+
+// Name, avatar and rating of a player: from the database for signed-in
+// players, from the app for guests (like in find_match).
+async function playerIdentity(socket, data) {
+    const authId = socket.data.authId || null;
+
+    if (authId) {
+        const profile = await loadPublicProfile(authId);
+        if (!profile?.username) throw new Error("PROFILE_NOT_FOUND");
+
+        return {
+            authId,
+            name: profile.username,
+            avatar: profile.avatar || "",
+            rating: Number.isFinite(profile.rating) ? profile.rating : DEFAULT_RATING,
+        };
+    }
+
+    const rating = Number(data?.rating);
+    if (!Number.isFinite(rating) || rating < 0) throw new Error("INVALID_RATING");
+    if (!isNonEmptyString(data?.name, 60)) throw new Error("INVALID_NAME");
+
+    return {
+        authId: null,
+        name: data.name,
+        avatar: isNonEmptyString(data?.avatar, 500) ? data.avatar : "",
+        rating: Math.min(MAX_GUEST_RATING, Math.round(rating)),
+    };
+}
+
+// =============================
+// RUSH HOUR (see rushHour.js)
+// =============================
+
+app.get("/events/rush-hour", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ...currentOrNextRushHour(), serverNow: Date.now() });
+});
+
+// The page behind an invite link.
+app.get("/invite/:code", (req, res) => {
+    const code = normalizeInviteCode(req.params.code);
+    const invite = liveInvite(code);
+
+    res.setHeader("Cache-Control", "no-store");
+    res.type("html").send(
+        invitePage({
+            code: code || "",
+            hostName: invite?.host.name,
+            timeControl: invite?.timeControl || "",
+            open: Boolean(invite),
+            downloadUrl: DOWNLOAD_URL,
+            webUrl: WEB_APP_URL,
+        })
+    );
+});
 
 app.post("/set-initial-rating", async (req, res) => {
     try {
@@ -1650,6 +1778,108 @@ io.on("connection", (socket) => {
         }
     });
 
+    // =============================
+    // INVITE LINKS
+    // =============================
+
+    // Host: create a link for a game with a friend.
+    socket.on("invite_create", async (data, ack) => {
+        const reply = (payload) => typeof ack === "function" && ack(payload);
+
+        try {
+            if (!allowAction(socket.id, "invite", 6, 60_000)) throw new Error("RATE_LIMITED");
+            if (socketToRoom.has(socket.id) && games.has(socketToRoom.get(socket.id))) throw new Error("ALREADY_IN_GAME");
+
+            const identity = await playerIdentity(socket, data);
+            if (!socket.connected) return;
+
+            closeInvitesOfSocket(socket.id);
+            removeFromQueue(socket.id);
+
+            let code = inviteCode();
+            while (invites.has(code)) code = inviteCode();
+
+            invites.set(code, {
+                code,
+                host: { id: socket.id, ...identity, joinedAt: Date.now() },
+                timeControl: resolveTimeControl(data?.timeControl),
+                createdAt: Date.now(),
+            });
+
+            reply({
+                ok: true,
+                code,
+                url: `${PUBLIC_URL}/invite/${code}`,
+                timeControl: invites.get(code).timeControl,
+                expiresInMs: INVITE_TTL_MS,
+            });
+        } catch (error) {
+            reply({ ok: false, error: error.message });
+        }
+    });
+
+    socket.on("invite_cancel", () => {
+        closeInvitesOfSocket(socket.id);
+    });
+
+    // Friend: who invited me, which time control?
+    socket.on("invite_info", (data, ack) => {
+        const reply = (payload) => typeof ack === "function" && ack(payload);
+        const invite = liveInvite(normalizeInviteCode(data?.code));
+
+        if (!invite) return reply({ ok: false, error: "INVITE_NOT_FOUND" });
+
+        reply({
+            ok: true,
+            host: { name: invite.host.name, avatar: invite.host.avatar, rating: invite.host.rating },
+            timeControl: invite.timeControl,
+            own: invite.host.id === socket.id,
+        });
+    });
+
+    // Friend: accept - the game starts for both.
+    socket.on("invite_join", async (data, ack) => {
+        const reply = (payload) => typeof ack === "function" && ack(payload);
+
+        try {
+            if (!allowAction(socket.id, "invite", 6, 60_000)) throw new Error("RATE_LIMITED");
+
+            const code = normalizeInviteCode(data?.code);
+            const invite = liveInvite(code);
+
+            if (!invite) throw new Error("INVITE_NOT_FOUND");
+            if (invite.host.id === socket.id) throw new Error("OWN_INVITE");
+            if (socket.data.authId && socket.data.authId === invite.host.authId) throw new Error("OWN_INVITE");
+            if (socketToRoom.has(socket.id) && games.has(socketToRoom.get(socket.id))) throw new Error("ALREADY_IN_GAME");
+            if (socketToRoom.has(invite.host.id) && games.has(socketToRoom.get(invite.host.id))) throw new Error("HOST_BUSY");
+
+            const identity = await playerIdentity(socket, data);
+
+            // Someone else may have been faster.
+            if (invites.get(code) !== invite || !socket.connected) throw new Error("INVITE_NOT_FOUND");
+
+            closeInvite(code);
+            removeFromQueue(socket.id);
+            removeFromQueue(invite.host.id);
+
+            const guest = { id: socket.id, ...identity, joinedAt: Date.now() };
+            const hostWhite = Math.random() < 0.5;
+
+            // Games from a link are friendly: guests can join, so the
+            // rating could not be trusted.
+            startPvPGame(invite.host, guest, {
+                whiteId: hostWhite ? invite.host.id : guest.id,
+                friendly: true,
+                challenge: true,
+                timeControl: invite.timeControl,
+            });
+
+            reply({ ok: true });
+        } catch (error) {
+            reply({ ok: false, error: error.message });
+        }
+    });
+
     socket.on("find_match", async (data) => {
         // The newest request counts: a search that is cancelled while the
         // profile is still loading must not put the player into the queue.
@@ -1736,10 +1966,12 @@ io.on("connection", (socket) => {
             rating,
             timeControl: resolveTimeControl(socket.data.matchRequest?.timeControl),
             joinedAt: Date.now(),
-            // After this long without a human in reach, a computer opponent
-            // takes the seat (a few seconds).
-            houseAfterMs: houseWaitMs(),
+            // After this long without a human in reach, the app offers a
+            // game against the POVCheck Bot.
+            // During Rush Hour real opponents are likely - wait longer.
+            houseAfterMs: isRushHour() ? houseWaitMs() * 3 : houseWaitMs(),
             houseStarting: false,
+            botOffered: false,
         };
 
         const opponent = findMatchForPlayer(player);
@@ -1747,6 +1979,18 @@ io.on("connection", (socket) => {
         if (!opponent) {
             matchmakingQueue.push(player);
             socket.emit("waiting", { timeControl: player.timeControl });
+
+            // Still alone after a few seconds: ask players who are not in
+            // the app right now (push.js limits how often and when).
+            setTimeout(() => {
+                if (!matchmakingQueue.includes(player)) return;
+                if (matchmakingQueue.some((p) => p !== player && p.timeControl === player.timeControl)) return;
+
+                notifySearching(
+                    { authId: player.authId, name: player.name, timeControl: player.timeControl },
+                    [...authenticatedUsers.keys()]
+                ).catch(() => { });
+            }, 8000);
 
             console.log("PLAYER WAITING:", {
                 id: player.id,
@@ -1760,6 +2004,10 @@ io.on("connection", (socket) => {
         }
 
         startPvPGame(player, opponent);
+    });
+
+    socket.on("accept_bot_offer", () => {
+        acceptBotOffer(socket);
     });
 
     socket.on("cancel_matchmaking", () => {
@@ -2144,6 +2392,7 @@ io.on("connection", (socket) => {
         }
 
         removeFromQueue(socket.id);
+        closeInvitesOfSocket(socket.id);
         rateBuckets.delete(socket.id);
 
         if (authId) {
